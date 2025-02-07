@@ -3,6 +3,12 @@
 ## Next
 
 
+### Changes
+
+- `oidc.map_legacy_users` and `oidc.strip_email_domain` has been removed
+  [#2411](https://github.com/juanfont/headscale/pull/2411)
+
+
 ## 0.25.0 (2025-02-xx)
 
 ### BREAKING
@@ -29,12 +35,26 @@
   [#2393](https://github.com/juanfont/headscale/pull/2393)
 - Change minimum hostname length to 2
   [#2393](https://github.com/juanfont/headscale/pull/2393)
+- Fix migration error caused by nodes having invalid auth keys
+  [#2412](https://github.com/juanfont/headscale/pull/2412)
 - Pre auth keys belonging to a user are no longer deleted with the user
   [#2396](https://github.com/juanfont/headscale/pull/2396)
 - Pre auth keys that are used by a node can no longer be deleted
   [#2396](https://github.com/juanfont/headscale/pull/2396)
 - Rehaul HTTP errors, return better status code and errors to users
   [#2398](https://github.com/juanfont/headscale/pull/2398)
+- Print headscale version and commit on server startup
+  [#2415](https://github.com/juanfont/headscale/pull/2415)
+
+## 0.24.3 (2025-02-07)
+
+### Changes
+- Fix migration error caused by nodes having invalid auth keys
+  [#2412](https://github.com/juanfont/headscale/pull/2412)
+- Pre auth keys belonging to a user are no longer deleted with the user
+  [#2396](https://github.com/juanfont/headscale/pull/2396)
+- Pre auth keys that are used by a node can no longer be deleted
+  [#2396](https://github.com/juanfont/headscale/pull/2396)
 
 ## 0.24.2 (2025-01-30)
 
