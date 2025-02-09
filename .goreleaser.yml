@@ -29,8 +29,8 @@ builds:
       - -mod=readonly
     ldflags:
       - -s -w
-      - -X github.com/juanfont/headscale/hscontrol/types.Version={{ .Version }}
-      - -X github.com/juanfont/headscale/hscontrol/types.GitCommitHash={{ .Commit }}
+      - -X github.com/avkiller/headscale/hscontrol/types.Version={{ .Version }}
+      - -X github.com/avkiller/headscale/hscontrol/types.GitCommitHash={{ .Commit }}
     tags:
       - ts2019
 
