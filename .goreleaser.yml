@@ -11,7 +11,7 @@ release:
 builds:
   - id: headscale
     main: ./cmd/headscale
-    mod_timestamp: "{{ .CommitTimestamp }}"
+    #mod_timestamp: "{{ .CommitTimestamp }}"
     env:
       - CGO_ENABLED=0
     targets:
