@@ -85,5 +85,7 @@ nfpms:
 
 checksum:
   name_template: "checksums.txt"
+changelog:
+  disable: true
 snapshot:
   version_template: "{{ .Tag }}-next"
