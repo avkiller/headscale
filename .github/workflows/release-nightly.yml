@@ -36,6 +36,6 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Run goreleaser
-        run: nix develop --command -- goreleaser release --snapshot --clean
+        run: nix develop --command -- goreleaser release --nightly --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
