@@ -40,7 +40,7 @@ archives:
   - formats: [ 'binary' ]  
 
 source:
-  enabled: true
+  enabled: false
   name_template: "{{ .ProjectName }}_{{ .Version }}"
   format: tar.gz
   files:
@@ -88,4 +88,4 @@ checksum:
 changelog:
   disable: true
 snapshot:
-  version_template: "{{ .Tag }}-next"
+  version_template: "{{ dev }}-next"
