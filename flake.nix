@@ -37,8 +37,8 @@
           ldflags = [
             "-s"
             "-w"
-            "-X github.com/juanfont/headscale/hscontrol/types.Version=${headscaleVersion}"
-            "-X github.com/juanfont/headscale/hscontrol/types.GitCommitHash=${commitHash}"
+            "-X github.com/avkiller/headscale/hscontrol/types.Version=${headscaleVersion}"
+            "-X github.com/avkiller/headscale/hscontrol/types.GitCommitHash=${commitHash}"
           ];
         };
 
