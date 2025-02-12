@@ -1,5 +1,5 @@
 ---
-name: Release snapshot
+name: build nightly version
 
 on:
   #push:
