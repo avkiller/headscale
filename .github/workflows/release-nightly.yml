@@ -6,6 +6,9 @@ on:
   #  tags:
   #    - "*" # triggers only if push new tag version
   workflow_dispatch:
+  
+env:
+  TAG_NAME: "nightly"
 
 jobs:
   goreleaser:
@@ -36,6 +39,14 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Run goreleaser
-        run: nix develop --command -- goreleaser release --nightly --clean
+        run: nix develop --command -- goreleaser release --snapshot --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Publish dist
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            dist/headscale*
