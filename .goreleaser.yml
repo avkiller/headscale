@@ -88,4 +88,4 @@ checksum:
 changelog:
   disable: true
 snapshot:
-  version_template: "{{.Version }}-dev"
+  version_template: "dev"
