@@ -9,9 +9,14 @@
   {
     "version": "0.99.99",
     "title": "0.99.99",
+    "aliases": []
+  },
+  {
+    "version": "0.25.1",
+    "title": "0.25.1",
     "aliases": [
-      "stable",
-      "latest"
+      "latest",
+      "stable"
     ]
   },
   {
