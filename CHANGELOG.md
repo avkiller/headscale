@@ -73,6 +73,11 @@ towards this code.
 The new policy can be used by setting the environment variable
 `HEADSCALE_EXPERIMENTAL_POLICY_V2` to `1`.
 
+#### Other breaking
+
+- Disallow `server_url` and `base_domain` to be equal
+  [#2544](https://github.com/juanfont/headscale/pull/2544)
+
 ### Changes
 
 - Use Go 1.24 [#2427](https://github.com/juanfont/headscale/pull/2427)
@@ -92,6 +97,8 @@ The new policy can be used by setting the environment variable
 - node FQDNs in the netmap will now contain a dot (".") at the end. This aligns
   with behaviour of tailscale.com
   [#2503](https://github.com/juanfont/headscale/pull/2503)
+- Restore support for "Override local DNS"
+  [#2438](https://github.com/juanfont/headscale/pull/2438)
 
 ## 0.25.1 (2025-02-25)
 
