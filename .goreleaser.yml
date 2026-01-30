@@ -3,7 +3,6 @@ version: 2
 before:
   hooks:
     - go mod tidy -compat=1.25
-    - go mod tidy -compat=1.25
     - go mod vendor
 
 release:
@@ -36,34 +35,15 @@ release:
     # Start headscale (migration will run automatically)
     systemctl start headscale
     ```
-  draft: true
-  header: |
-    ## Upgrade
 
-    Please follow the steps outlined in the [upgrade guide](https://headscale.net/stable/setup/upgrade/) to update your existing Headscale installation.
 
-    **It's best to update from one stable version to the next** (e.g., 0.24.0 → 0.25.1 → 0.26.1) in case you are multiple releases behind. You should always pick the latest available patch release.
 
-    Be sure to check the changelog above for version-specific upgrade instructions and breaking changes.
 
-    ### Backup Your Database
 
-    **Always backup your database before upgrading.** Here's how to backup a SQLite database:
 
-    ```bash
-    # Stop headscale
-    systemctl stop headscale
 
-    # Backup sqlite database
-    cp /var/lib/headscale/db.sqlite /var/lib/headscale/db.sqlite.backup
 
-    # Backup sqlite WAL/SHM files (if they exist)
-    cp /var/lib/headscale/db.sqlite-wal /var/lib/headscale/db.sqlite-wal.backup
-    cp /var/lib/headscale/db.sqlite-shm /var/lib/headscale/db.sqlite-shm.backup
 
-    # Start headscale (migration will run automatically)
-    systemctl start headscale
-    ```
 
 builds:
   - id: headscale
@@ -84,17 +64,14 @@ builds:
       #- linux_arm_7
     flags:
       - -mod=readonly
-    ldflags:
-      - -s -w
-      - -X github.com/avkiller/headscale/hscontrol/types.Version={{ .Version }}
-      - -X github.com/avkiller/headscale/hscontrol/types.GitCommitHash={{ .Commit }}
     tags:
       - ts2019
 
 archives:
   - id: golang-cross
     name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}{{ with .Mips }}_{{ . }}{{ end }}{{ if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}'
-  - formats: [ 'binary' ]  
+    formats:
+      - binary
 
 source:
   enabled: false
@@ -114,7 +91,6 @@ nfpms:
   # Package metadata: dpkg --info dist/headscale....deb
   #
   - ids:
-  - ids:
       - headscale
     package_name: headscale
     priority: optional
@@ -128,15 +104,7 @@ nfpms:
       hobbyists with an open-source server they can use for their projects and
       labs. It implements a narrow scope, a single Tailscale network (tailnet),
       suitable for a personal use, or a small open-source organisation.
-    description: |-
-      Open source implementation of the Tailscale control server.
-      Headscale aims to implement a self-hosted, open source alternative to the
-      Tailscale control server. Headscale's goal is to provide self-hosters and
-      hobbyists with an open-source server they can use for their projects and
-      labs. It implements a narrow scope, a single Tailscale network (tailnet),
-      suitable for a personal use, or a small open-source organisation.
     bindir: /usr/bin
-    section: net
     section: net
     formats:
       - deb
@@ -147,12 +115,9 @@ nfpms:
         file_info:
           mode: 0644
       - src: ./packaging/systemd/headscale.service
-      - src: ./packaging/systemd/headscale.service
         dst: /usr/lib/systemd/system/headscale.service
       - dst: /var/lib/headscale
         type: dir
-      - src: LICENSE
-        dst: /usr/share/doc/headscale/copyright
       - src: LICENSE
         dst: /usr/share/doc/headscale/copyright
     scripts:

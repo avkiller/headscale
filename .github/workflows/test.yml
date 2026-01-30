@@ -1,21 +1,6 @@
 name: Tests
 
-on: 
-  pull_request:
-    paths-ignore:
-      - ".github/**"
-      - "docs/**"
-      - "*.md"
-      - ".gitmodules"
-      - "version.go"
-  push:
-    paths-ignore:
-      - ".github/**"
-      - "docs/**"
-      - "*.md"
-      - "res/**"
-      - ".gitmodules"
-      - "version.go"
+on: [push, pull_request]
 
 concurrency:
   group: ${{ github.workflow }}-$${{ github.head_ref || github.run_id }}
