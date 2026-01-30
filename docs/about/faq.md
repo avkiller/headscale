@@ -44,6 +44,15 @@ For convenience, we also [build container images with headscale](../setup/instal
 we don't officially support deploying headscale using Docker**. On our [Discord server](https://discord.gg/c84AZQhmpx)
 we have a "docker-issues" channel where you can ask for Docker-specific help to the community.
 
+## What is the recommended update path? Can I skip multiple versions while updating?
+
+Please follow the steps outlined in the [upgrade guide](../setup/upgrade.md) to update your existing Headscale
+installation. Its best to update from one stable version to the next (e.g. 0.24.0 &rarr; 0.25.1 &rarr; 0.26.1) in case
+you are multiple releases behind. You should always pick the latest available patch release.
+
+Be sure to check the [changelog](https://github.com/juanfont/headscale/blob/main/CHANGELOG.md) for version specific
+upgrade instructions and breaking changes.
+
 ## Scaling / How many clients does Headscale support?
 
 It depends. As often stated, Headscale is not enterprise software and our focus
@@ -51,22 +60,22 @@ is homelabbers and self-hosters. Of course, we do not prevent people from using
 it in a commercial/professional setting and often get questions about scaling.
 
 Please note that when Headscale is developed, performance is not part of the
-consideration as the main audience is considered to be users with a moddest
+consideration as the main audience is considered to be users with a modest
 amount of devices. We focus on correctness and feature parity with Tailscale
 SaaS over time.
 
-To understand if you might be able to use Headscale for your usecase, I will
+To understand if you might be able to use Headscale for your use case, I will
 describe two scenarios in an effort to explain what is the central bottleneck
 of Headscale:
 
 1. An environment with 1000 servers
 
-    - they rarely  "move" (change their endpoints)
-    - new nodes are added rarely
+   - they rarely "move" (change their endpoints)
+   - new nodes are added rarely
 
 2. An environment with 80 laptops/phones (end user devices)
 
-    - nodes move often, e.g. switching from home to office
+   - nodes move often, e.g. switching from home to office
 
 Headscale calculates a map of all nodes that need to talk to each other,
 creating this "world map" requires a lot of CPU time. When an event that
@@ -76,7 +85,7 @@ new "world map" is created for every node in the network.
 This means that under certain conditions, Headscale can likely handle 100s
 of devices (maybe more), if there is _little to no change_ happening in the
 network. For example, in Scenario 1, the process of computing the world map is
-extremly demanding due to the size of the network, but when the map has been
+extremely demanding due to the size of the network, but when the map has been
 created and the nodes are not changing, the Headscale instance will likely
 return to a very low resource usage until the next time there is an event
 requiring the new map.
@@ -94,14 +103,14 @@ learn about the current state of the world.
 We expect that the performance will improve over time as we improve the code
 base, but it is not a focus. In general, we will never make the tradeoff to make
 things faster on the cost of less maintainable or readable code. We are a small
-team and have to optimise for maintainabillity.
+team and have to optimise for maintainability.
 
 ## Which database should I use?
 
 We recommend the use of SQLite as database for headscale:
 
 - SQLite is simple to setup and easy to use
-- It scales well for all of headscale's usecases
+- It scales well for all of headscale's use cases
 - Development and testing happens primarily on SQLite
 - PostgreSQL is still supported, but is considered to be in "maintenance mode"
 
@@ -122,7 +131,6 @@ help to the community.
 
 Running headscale on a machine that is also in the tailnet can cause problems with subnet routers, traffic relay nodes, and MagicDNS. It might work, but it is not supported.
 
-
 ## Why do two nodes see each other in their status, even if an ACL allows traffic only in one direction?
 
 A frequent use case is to allow traffic only from one node to another, but not the other way around. For example, the
@@ -135,3 +143,35 @@ in their output of `tailscale status`. Traffic is still filtered according to th
 ping` which is always allowed in either direction.
 
 See also <https://tailscale.com/kb/1087/device-visibility>.
+
+## My policy is stored in the database and Headscale refuses to start due to an invalid policy. How can I recover?
+
+Headscale checks if the policy is valid during startup and refuses to start if it detects an error. The error message
+indicates which part of the policy is invalid. Follow these steps to fix your policy:
+
+- Dump the policy to a file: `headscale policy get --bypass-grpc-and-access-database-directly > policy.json`
+- Edit and fixup `policy.json`. Use the command `headscale policy check --file policy.json` to validate the policy.
+- Load the modified policy: `headscale policy set --bypass-grpc-and-access-database-directly --file policy.json`
+- Start Headscale as usual.
+
+!!! warning "Full server configuration required"
+
+    The above commands to get/set the policy require a complete server configuration file including database settings. A
+    minimal config to [control Headscale via remote CLI](../ref/api.md#grpc) is not sufficient. You may use `headscale
+    -c /path/to/config.yaml` to specify the path to an alternative configuration file.
+
+## How can I avoid to send logs to Tailscale Inc?
+
+A Tailscale client [collects logs about its operation and connection attempts with other
+clients](https://tailscale.com/kb/1011/log-mesh-traffic#client-logs) and sends them to a central log service operated by
+Tailscale Inc.
+
+Headscale, by default, instructs clients to disable log submission to the central log service. This configuration is
+applied by a client once it successfully connected with Headscale. See the configuration option `logtail.enabled` in the
+[configuration file](../ref/configuration.md) for details.
+
+Alternatively, logging can also be disabled on the client side. This is independent of Headscale and opting out of
+client logging disables log submission early during client startup. The configuration is operating system specific and
+is usually achieved by setting the environment variable `TS_NO_LOGS_NO_SUPPORT=true` or by passing the flag
+`--no-logs-no-support` to `tailscaled`. See
+<https://tailscale.com/kb/1011/log-mesh-traffic#opting-out-of-client-logging> for details.

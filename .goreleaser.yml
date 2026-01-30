@@ -2,11 +2,39 @@
 version: 2
 before:
   hooks:
-    - go mod tidy -compat=1.24
+    - go mod tidy -compat=1.25
     - go mod vendor
 
 release:
   prerelease: auto
+  draft: true
+  header: |
+    ## Upgrade
+
+    Please follow the steps outlined in the [upgrade guide](https://headscale.net/stable/setup/upgrade/) to update your existing Headscale installation.
+
+    **It's best to update from one stable version to the next** (e.g., 0.24.0 → 0.25.1 → 0.26.1) in case you are multiple releases behind. You should always pick the latest available patch release.
+
+    Be sure to check the changelog above for version-specific upgrade instructions and breaking changes.
+
+    ### Backup Your Database
+
+    **Always backup your database before upgrading.** Here's how to backup a SQLite database:
+
+    ```bash
+    # Stop headscale
+    systemctl stop headscale
+
+    # Backup sqlite database
+    cp /var/lib/headscale/db.sqlite /var/lib/headscale/db.sqlite.backup
+
+    # Backup sqlite WAL/SHM files (if they exist)
+    cp /var/lib/headscale/db.sqlite-wal /var/lib/headscale/db.sqlite-wal.backup
+    cp /var/lib/headscale/db.sqlite-shm /var/lib/headscale/db.sqlite-shm.backup
+
+    # Start headscale (migration will run automatically)
+    systemctl start headscale
+    ```
 
 builds:
   - id: headscale
@@ -56,15 +84,22 @@ nfpms:
   # List file contents: dpkg -c dist/headscale...deb
   # Package metadata: dpkg --info dist/headscale....deb
   #
-  - builds:
+  - ids:
       - headscale
     package_name: headscale
     priority: optional
     vendor: headscale
     maintainer: Kristoffer Dalby <kristoffer@dalby.cc>
     homepage: https://github.com/juanfont/headscale
-    license: BSD
+    description: |-
+      Open source implementation of the Tailscale control server.
+      Headscale aims to implement a self-hosted, open source alternative to the
+      Tailscale control server. Headscale's goal is to provide self-hosters and
+      hobbyists with an open-source server they can use for their projects and
+      labs. It implements a narrow scope, a single Tailscale network (tailnet),
+      suitable for a personal use, or a small open-source organisation.
     bindir: /usr/bin
+    section: net
     formats:
       - deb
     contents:
@@ -73,15 +108,21 @@ nfpms:
         type: config|noreplace
         file_info:
           mode: 0644
-      - src: ./docs/packaging/headscale.systemd.service
+      - src: ./packaging/systemd/headscale.service
         dst: /usr/lib/systemd/system/headscale.service
       - dst: /var/lib/headscale
         type: dir
-      - dst: /var/run/headscale
-        type: dir
+      - src: LICENSE
+        dst: /usr/share/doc/headscale/copyright
     scripts:
-      postinstall: ./docs/packaging/postinstall.sh
-      postremove: ./docs/packaging/postremove.sh
+      postinstall: ./packaging/deb/postinst
+      postremove: ./packaging/deb/postrm
+      preremove: ./packaging/deb/prerm
+    deb:
+      lintian_overrides:
+        - no-changelog # Our CHANGELOG.md uses a different formatting
+        - no-manual-page
+        - statically-linked-binary
 
 checksum:
   name_template: "checksums.txt"

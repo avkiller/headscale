@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,13 +13,13 @@ import (
 	tcmp "github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
-	policyv1 "github.com/juanfont/headscale/hscontrol/policy/v1"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
+	"tailscale.com/tailcfg"
 )
 
 func executeAndUnmarshal[T any](headscale ControlServer, command []string, result T) error {
@@ -28,7 +30,7 @@ func executeAndUnmarshal[T any](headscale ControlServer, command []string, resul
 
 	err = json.Unmarshal([]byte(str), result)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal: %s\n command err: %s", err, str)
+		return fmt.Errorf("failed to unmarshal: %w\n command err: %s", err, str)
 	}
 
 	return nil
@@ -46,43 +48,50 @@ func sortWithID[T GRPCSortable](a, b T) int {
 
 func TestUserCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	spec := ScenarioSpec{
 		Users: []string{"user1", "user2"},
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
-	var listUsers []*v1.User
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"users",
-			"list",
-			"--output",
-			"json",
-		},
-		&listUsers,
+	var (
+		listUsers []*v1.User
+		result    []string
 	)
-	assertNoErr(t, err)
 
-	slices.SortFunc(listUsers, sortWithID)
-	result := []string{listUsers[0].GetName(), listUsers[1].GetName()}
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		err := executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"users",
+				"list",
+				"--output",
+				"json",
+			},
+			&listUsers,
+		)
+		assert.NoError(ct, err)
 
-	assert.Equal(
-		t,
-		[]string{"user1", "user2"},
-		result,
-	)
+		slices.SortFunc(listUsers, sortWithID)
+		result = []string{listUsers[0].GetName(), listUsers[1].GetName()}
+
+		assert.Equal(
+			ct,
+			[]string{"user1", "user2"},
+			result,
+			"Should have user1 and user2 in users list",
+		)
+	}, 20*time.Second, 1*time.Second)
 
 	_, err = headscale.Execute(
 		[]string{
@@ -94,45 +103,53 @@ func TestUserCommand(t *testing.T) {
 			"--new-name=newname",
 		},
 	)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	var listAfterRenameUsers []*v1.User
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"users",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAfterRenameUsers,
-	)
-	assertNoErr(t, err)
 
-	slices.SortFunc(listUsers, sortWithID)
-	result = []string{listAfterRenameUsers[0].GetName(), listAfterRenameUsers[1].GetName()}
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		err := executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"users",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAfterRenameUsers,
+		)
+		assert.NoError(ct, err)
 
-	assert.Equal(
-		t,
-		[]string{"user1", "newname"},
-		result,
-	)
+		slices.SortFunc(listAfterRenameUsers, sortWithID)
+		result = []string{listAfterRenameUsers[0].GetName(), listAfterRenameUsers[1].GetName()}
+
+		assert.Equal(
+			ct,
+			[]string{"user1", "newname"},
+			result,
+			"Should have user1 and newname after rename operation",
+		)
+	}, 20*time.Second, 1*time.Second)
 
 	var listByUsername []*v1.User
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"users",
-			"list",
-			"--output",
-			"json",
-			"--name=user1",
-		},
-		&listByUsername,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"users",
+				"list",
+				"--output",
+				"json",
+				"--name=user1",
+			},
+			&listByUsername,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for user list by username")
 
 	slices.SortFunc(listByUsername, sortWithID)
+
 	want := []*v1.User{
 		{
 			Id:    1,
@@ -146,20 +163,24 @@ func TestUserCommand(t *testing.T) {
 	}
 
 	var listByID []*v1.User
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"users",
-			"list",
-			"--output",
-			"json",
-			"--identifier=1",
-		},
-		&listByID,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"users",
+				"list",
+				"--output",
+				"json",
+				"--identifier=1",
+			},
+			&listByID,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for user list by ID")
 
 	slices.SortFunc(listByID, sortWithID)
+
 	want = []*v1.User{
 		{
 			Id:    1,
@@ -182,34 +203,38 @@ func TestUserCommand(t *testing.T) {
 			"--identifier=1",
 		},
 	)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Contains(t, deleteResult, "User destroyed")
 
 	var listAfterIDDelete []*v1.User
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"users",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAfterIDDelete,
-	)
-	assertNoErr(t, err)
 
-	slices.SortFunc(listAfterIDDelete, sortWithID)
-	want = []*v1.User{
-		{
-			Id:    2,
-			Name:  "newname",
-			Email: "user2@test.no",
-		},
-	}
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		err := executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"users",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAfterIDDelete,
+		)
+		assert.NoError(ct, err)
 
-	if diff := tcmp.Diff(want, listAfterIDDelete, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
-		t.Errorf("unexpected users (-want +got):\n%s", diff)
-	}
+		slices.SortFunc(listAfterIDDelete, sortWithID)
+
+		want := []*v1.User{
+			{
+				Id:    2,
+				Name:  "newname",
+				Email: "user2@test.no",
+			},
+		}
+
+		if diff := tcmp.Diff(want, listAfterIDDelete, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
+			assert.Fail(ct, "unexpected users", "diff (-want +got):\n%s", diff)
+		}
+	}, 20*time.Second, 1*time.Second)
 
 	deleteResult, err = headscale.Execute(
 		[]string{
@@ -220,28 +245,29 @@ func TestUserCommand(t *testing.T) {
 			"--name=newname",
 		},
 	)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Contains(t, deleteResult, "User destroyed")
 
 	var listAfterNameDelete []v1.User
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"users",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAfterNameDelete,
-	)
-	assertNoErr(t, err)
 
-	require.Len(t, listAfterNameDelete, 0)
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"users",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAfterNameDelete,
+		)
+		assert.NoError(c, err)
+		assert.Empty(c, listAfterNameDelete)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for user list after name delete")
 }
 
 func TestPreAuthKeyCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	user := "preauthkeyspace"
 	count := 3
@@ -251,39 +277,44 @@ func TestPreAuthKeyCommand(t *testing.T) {
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clipak"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	keys := make([]*v1.PreAuthKey, count)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 
 	for index := range count {
 		var preAuthKey v1.PreAuthKey
-		err := executeAndUnmarshal(
-			headscale,
-			[]string{
-				"headscale",
-				"preauthkeys",
-				"--user",
-				user,
-				"create",
-				"--reusable",
-				"--expiration",
-				"24h",
-				"--output",
-				"json",
-				"--tags",
-				"tag:test1,tag:test2",
-			},
-			&preAuthKey,
-		)
-		assertNoErr(t, err)
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			err := executeAndUnmarshal(
+				headscale,
+				[]string{
+					"headscale",
+					"preauthkeys",
+					"--user",
+					"1",
+					"create",
+					"--reusable",
+					"--expiration",
+					"24h",
+					"--output",
+					"json",
+					"--tags",
+					"tag:test1,tag:test2",
+				},
+				&preAuthKey,
+			)
+			assert.NoError(c, err)
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for preauth key creation")
 
 		keys[index] = &preAuthKey
 	}
@@ -291,37 +322,39 @@ func TestPreAuthKeyCommand(t *testing.T) {
 	assert.Len(t, keys, 3)
 
 	var listedPreAuthKeys []v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"list",
-			"--output",
-			"json",
-		},
-		&listedPreAuthKeys,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedPreAuthKeys,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for preauth keys list")
 
 	// There is one key created by "scenario.CreateHeadscaleEnv"
 	assert.Len(t, listedPreAuthKeys, 4)
 
 	assert.Equal(
 		t,
-		[]string{keys[0].GetId(), keys[1].GetId(), keys[2].GetId()},
-		[]string{
+		[]uint64{keys[0].GetId(), keys[1].GetId(), keys[2].GetId()},
+		[]uint64{
 			listedPreAuthKeys[1].GetId(),
 			listedPreAuthKeys[2].GetId(),
 			listedPreAuthKeys[3].GetId(),
 		},
 	)
 
-	assert.NotEmpty(t, listedPreAuthKeys[1].GetKey())
-	assert.NotEmpty(t, listedPreAuthKeys[2].GetKey())
-	assert.NotEmpty(t, listedPreAuthKeys[3].GetKey())
+	// New keys show prefix after listing, so check the created keys instead
+	assert.NotEmpty(t, keys[0].GetKey())
+	assert.NotEmpty(t, keys[1].GetKey())
+	assert.NotEmpty(t, keys[2].GetKey())
 
 	assert.True(t, listedPreAuthKeys[1].GetExpiration().AsTime().After(time.Now()))
 	assert.True(t, listedPreAuthKeys[2].GetExpiration().AsTime().After(time.Now()))
@@ -345,7 +378,11 @@ func TestPreAuthKeyCommand(t *testing.T) {
 			continue
 		}
 
-		assert.Equal(t, listedPreAuthKeys[index].GetAclTags(), []string{"tag:test1", "tag:test2"})
+		assert.Equal(
+			t,
+			[]string{"tag:test1", "tag:test2"},
+			listedPreAuthKeys[index].GetAclTags(),
+		)
 	}
 
 	// Test key expiry
@@ -353,29 +390,29 @@ func TestPreAuthKeyCommand(t *testing.T) {
 		[]string{
 			"headscale",
 			"preauthkeys",
-			"--user",
-			user,
 			"expire",
-			listedPreAuthKeys[1].GetKey(),
+			"--id",
+			strconv.FormatUint(keys[0].GetId(), 10),
 		},
 	)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	var listedPreAuthKeysAfterExpire []v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"list",
-			"--output",
-			"json",
-		},
-		&listedPreAuthKeysAfterExpire,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedPreAuthKeysAfterExpire,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for preauth keys list after expire")
 
 	assert.True(t, listedPreAuthKeysAfterExpire[1].GetExpiration().AsTime().Before(time.Now()))
 	assert.True(t, listedPreAuthKeysAfterExpire[2].GetExpiration().AsTime().After(time.Now()))
@@ -384,7 +421,6 @@ func TestPreAuthKeyCommand(t *testing.T) {
 
 func TestPreAuthKeyCommandWithoutExpiry(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	user := "pre-auth-key-without-exp-user"
 	spec := ScenarioSpec{
@@ -392,47 +428,52 @@ func TestPreAuthKeyCommandWithoutExpiry(t *testing.T) {
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clipaknaexp"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	var preAuthKey v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"create",
-			"--reusable",
-			"--output",
-			"json",
-		},
-		&preAuthKey,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"--user",
+				"1",
+				"create",
+				"--reusable",
+				"--output",
+				"json",
+			},
+			&preAuthKey,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for preauth key creation without expiry")
 
 	var listedPreAuthKeys []v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"list",
-			"--output",
-			"json",
-		},
-		&listedPreAuthKeys,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedPreAuthKeys,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for preauth keys list")
 
 	// There is one key created by "scenario.CreateHeadscaleEnv"
 	assert.Len(t, listedPreAuthKeys, 2)
@@ -446,7 +487,6 @@ func TestPreAuthKeyCommandWithoutExpiry(t *testing.T) {
 
 func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	user := "pre-auth-key-reus-ephm-user"
 	spec := ScenarioSpec{
@@ -454,67 +494,75 @@ func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clipakresueeph"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	var preAuthReusableKey v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"create",
-			"--reusable=true",
-			"--output",
-			"json",
-		},
-		&preAuthReusableKey,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"--user",
+				"1",
+				"create",
+				"--reusable=true",
+				"--output",
+				"json",
+			},
+			&preAuthReusableKey,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for reusable preauth key creation")
 
 	var preAuthEphemeralKey v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"create",
-			"--ephemeral=true",
-			"--output",
-			"json",
-		},
-		&preAuthEphemeralKey,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"--user",
+				"1",
+				"create",
+				"--ephemeral=true",
+				"--output",
+				"json",
+			},
+			&preAuthEphemeralKey,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for ephemeral preauth key creation")
 
 	assert.True(t, preAuthEphemeralKey.GetEphemeral())
 	assert.False(t, preAuthEphemeralKey.GetReusable())
 
 	var listedPreAuthKeys []v1.PreAuthKey
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user,
-			"list",
-			"--output",
-			"json",
-		},
-		&listedPreAuthKeys,
-	)
-	assertNoErr(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedPreAuthKeys,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for preauth keys list after reusable/ephemeral creation")
 
 	// There is one key created by "scenario.CreateHeadscaleEnv"
 	assert.Len(t, listedPreAuthKeys, 3)
@@ -522,7 +570,6 @@ func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 
 func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	user1 := "user1"
 	user2 := "user2"
@@ -533,7 +580,8 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv(
@@ -542,43 +590,51 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 		hsic.WithEmbeddedDERPServerOnly(),
 		hsic.WithTLS(),
 	)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
-	err = headscale.CreateUser(user2)
-	assertNoErr(t, err)
+	u2, err := headscale.CreateUser(user2)
+	require.NoError(t, err)
 
 	var user2Key v1.PreAuthKey
 
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"preauthkeys",
-			"--user",
-			user2,
-			"create",
-			"--reusable",
-			"--expiration",
-			"24h",
-			"--output",
-			"json",
-			"--tags",
-			"tag:test1,tag:test2",
-		},
-		&user2Key,
-	)
-	assertNoErr(t, err)
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"--user",
+				strconv.FormatUint(u2.GetId(), 10),
+				"create",
+				"--reusable",
+				"--expiration",
+				"24h",
+				"--output",
+				"json",
+				"--tags",
+				"tag:test1,tag:test2",
+			},
+			&user2Key,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for user2 preauth key creation")
 
-	listNodes, err := headscale.ListNodes()
-	require.Nil(t, err)
-	require.Len(t, listNodes, 1)
-	assert.Equal(t, user1, listNodes[0].GetUser().GetName())
+	var listNodes []*v1.Node
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+
+		listNodes, err = headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, listNodes, 1, "Should have exactly 1 node for user1")
+		assert.Equal(ct, user1, listNodes[0].GetUser().GetName(), "Node should belong to user1")
+	}, 15*time.Second, 1*time.Second)
 
 	allClients, err := scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
+	requireNoErrListClients(t, err)
 
 	require.Len(t, allClients, 1)
 
@@ -586,40 +642,161 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 
 	// Log out from user1
 	err = client.Logout()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	err = scenario.WaitForTailscaleLogout()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
-	status, err := client.Status()
-	assertNoErr(t, err)
-	if status.BackendState == "Starting" || status.BackendState == "Running" {
-		t.Fatalf("expected node to be logged out, backend state: %s", status.BackendState)
-	}
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := client.Status()
+		assert.NoError(ct, err)
+		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
+			"Expected node to be logged out, backend state: %s", status.BackendState)
+	}, 30*time.Second, 2*time.Second)
 
 	err = client.Login(headscale.GetEndpoint(), user2Key.GetKey())
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
-	status, err = client.Status()
-	assertNoErr(t, err)
-	if status.BackendState != "Running" {
-		t.Fatalf("expected node to be logged in, backend state: %s", status.BackendState)
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := client.Status()
+		assert.NoError(ct, err)
+		assert.Equal(ct, "Running", status.BackendState, "Expected node to be logged in, backend state: %s", status.BackendState)
+		// With tags-as-identity model, tagged nodes show as TaggedDevices user (2147455555)
+		// The PreAuthKey was created with tags, so the node is tagged
+		assert.Equal(ct, "userid:2147455555", status.Self.UserID.String(), "Expected node to be logged in as tagged-devices user")
+	}, 30*time.Second, 2*time.Second)
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+
+		listNodes, err = headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, listNodes, 2, "Should have 2 nodes after re-login")
+		assert.Equal(ct, user1, listNodes[0].GetUser().GetName(), "First node should belong to user1")
+		// Second node is tagged (created with tagged PreAuthKey), so it shows as "tagged-devices"
+		assert.Equal(ct, "tagged-devices", listNodes[1].GetUser().GetName(), "Second node should be tagged-devices")
+	}, 20*time.Second, 1*time.Second)
+}
+
+func TestTaggedNodesCLIOutput(t *testing.T) {
+	IntegrationSkip(t)
+
+	user1 := "user1"
+	user2 := "user2"
+
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{user1},
 	}
 
-	if status.Self.UserID.String() != "userid:2" {
-		t.Fatalf("expected node to be logged in as userid:2, got: %s", status.Self.UserID.String())
-	}
+	scenario, err := NewScenario(spec)
 
-	listNodes, err = headscale.ListNodes()
-	require.Nil(t, err)
-	require.Len(t, listNodes, 2)
-	assert.Equal(t, user1, listNodes[0].GetUser().GetName())
-	assert.Equal(t, user2, listNodes[1].GetUser().GetName())
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv(
+		[]tsic.Option{},
+		hsic.WithTestName("tagcli"),
+		hsic.WithEmbeddedDERPServerOnly(),
+		hsic.WithTLS(),
+	)
+	require.NoError(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	u2, err := headscale.CreateUser(user2)
+	require.NoError(t, err)
+
+	var user2Key v1.PreAuthKey
+
+	// Create a tagged PreAuthKey for user2
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"preauthkeys",
+				"--user",
+				strconv.FormatUint(u2.GetId(), 10),
+				"create",
+				"--reusable",
+				"--expiration",
+				"24h",
+				"--output",
+				"json",
+				"--tags",
+				"tag:test1,tag:test2",
+			},
+			&user2Key,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for user2 tagged preauth key creation")
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	require.Len(t, allClients, 1)
+
+	client := allClients[0]
+
+	// Log out from user1
+	err = client.Logout()
+	require.NoError(t, err)
+
+	err = scenario.WaitForTailscaleLogout()
+	require.NoError(t, err)
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := client.Status()
+		assert.NoError(ct, err)
+		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
+			"Expected node to be logged out, backend state: %s", status.BackendState)
+	}, 30*time.Second, 2*time.Second)
+
+	// Log in with the tagged PreAuthKey (from user2, with tags)
+	err = client.Login(headscale.GetEndpoint(), user2Key.GetKey())
+	require.NoError(t, err)
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := client.Status()
+		assert.NoError(ct, err)
+		assert.Equal(ct, "Running", status.BackendState, "Expected node to be logged in, backend state: %s", status.BackendState)
+		// With tags-as-identity model, tagged nodes show as TaggedDevices user (2147455555)
+		assert.Equal(ct, "userid:2147455555", status.Self.UserID.String(), "Expected node to be logged in as tagged-devices user")
+	}, 30*time.Second, 2*time.Second)
+
+	// Wait for the second node to appear
+	var listNodes []*v1.Node
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+
+		listNodes, err = headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, listNodes, 2, "Should have 2 nodes after re-login with tagged key")
+		assert.Equal(ct, user1, listNodes[0].GetUser().GetName(), "First node should belong to user1")
+		assert.Equal(ct, "tagged-devices", listNodes[1].GetUser().GetName(), "Second node should be tagged-devices")
+	}, 20*time.Second, 1*time.Second)
+
+	// Test: tailscale status output should show "tagged-devices" not "userid:2147455555"
+	// This is the fix for issue #2970 - the Tailscale client should display user-friendly names
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		stdout, stderr, err := client.Execute([]string{"tailscale", "status"})
+		assert.NoError(ct, err, "tailscale status command should succeed, stderr: %s", stderr)
+
+		t.Logf("Tailscale status output:\n%s", stdout)
+
+		// The output should contain "tagged-devices" for tagged nodes
+		assert.Contains(ct, stdout, "tagged-devices", "Tailscale status should show 'tagged-devices' for tagged nodes")
+
+		// The output should NOT show the raw numeric userid to the user
+		assert.NotContains(ct, stdout, "userid:2147455555", "Tailscale status should not show numeric userid for tagged nodes")
+	}, 20*time.Second, 1*time.Second)
 }
 
 func TestApiKeyCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	count := 5
 
@@ -628,14 +805,15 @@ func TestApiKeyCommand(t *testing.T) {
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	keys := make([]string, count)
 
@@ -651,7 +829,7 @@ func TestApiKeyCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.NotEmpty(t, apiResult)
 
 		keys[idx] = apiResult
@@ -660,17 +838,20 @@ func TestApiKeyCommand(t *testing.T) {
 	assert.Len(t, keys, 5)
 
 	var listedAPIKeys []v1.ApiKey
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"apikeys",
-			"list",
-			"--output",
-			"json",
-		},
-		&listedAPIKeys,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"apikeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedAPIKeys,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for API keys list")
 
 	assert.Len(t, listedAPIKeys, 5)
 
@@ -726,23 +907,26 @@ func TestApiKeyCommand(t *testing.T) {
 				listedAPIKeys[idx].GetPrefix(),
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		expiredPrefixes[listedAPIKeys[idx].GetPrefix()] = true
 	}
 
 	var listedAfterExpireAPIKeys []v1.ApiKey
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"apikeys",
-			"list",
-			"--output",
-			"json",
-		},
-		&listedAfterExpireAPIKeys,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"apikeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedAfterExpireAPIKeys,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for API keys list after expire")
 
 	for index := range listedAfterExpireAPIKeys {
 		if _, ok := expiredPrefixes[listedAfterExpireAPIKeys[index].GetPrefix()]; ok {
@@ -768,283 +952,115 @@ func TestApiKeyCommand(t *testing.T) {
 			"--prefix",
 			listedAPIKeys[0].GetPrefix(),
 		})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	var listedAPIKeysAfterDelete []v1.ApiKey
-	err = executeAndUnmarshal(headscale,
-		[]string{
-			"headscale",
-			"apikeys",
-			"list",
-			"--output",
-			"json",
-		},
-		&listedAPIKeysAfterDelete,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"apikeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedAPIKeysAfterDelete,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for API keys list after delete")
 
 	assert.Len(t, listedAPIKeysAfterDelete, 4)
-}
 
-func TestNodeTagCommand(t *testing.T) {
-	IntegrationSkip(t)
-	t.Parallel()
-
-	spec := ScenarioSpec{
-		Users: []string{"user1"},
-	}
-
-	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
-	defer scenario.ShutdownAssertNoPanics(t)
-
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
-
-	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
-
-	regIDs := []string{
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-	}
-	nodes := make([]*v1.Node, len(regIDs))
-	assert.Nil(t, err)
-
-	for index, regID := range regIDs {
-		_, err := headscale.Execute(
-			[]string{
-				"headscale",
-				"debug",
-				"create-node",
-				"--name",
-				fmt.Sprintf("node-%d", index+1),
-				"--user",
-				"user1",
-				"--key",
-				regID,
-				"--output",
-				"json",
-			},
-		)
-		assert.Nil(t, err)
-
-		var node v1.Node
-		err = executeAndUnmarshal(
-			headscale,
-			[]string{
-				"headscale",
-				"nodes",
-				"--user",
-				"user1",
-				"register",
-				"--key",
-				regID,
-				"--output",
-				"json",
-			},
-			&node,
-		)
-		assert.Nil(t, err)
-
-		nodes[index] = &node
-	}
-	assert.Len(t, nodes, len(regIDs))
-
-	var node v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"tag",
-			"-i", "1",
-			"-t", "tag:test",
-			"--output", "json",
-		},
-		&node,
-	)
-	assert.Nil(t, err)
-
-	assert.Equal(t, []string{"tag:test"}, node.GetForcedTags())
-
+	// Test expire by ID (using key at index 0)
 	_, err = headscale.Execute(
 		[]string{
 			"headscale",
-			"nodes",
-			"tag",
-			"-i", "2",
-			"-t", "wrong-tag",
-			"--output", "json",
-		},
-	)
-	assert.ErrorContains(t, err, "tag must start with the string 'tag:'")
+			"apikeys",
+			"expire",
+			"--id",
+			strconv.FormatUint(listedAPIKeysAfterDelete[0].GetId(), 10),
+		})
+	require.NoError(t, err)
 
-	// Test list all nodes after added seconds
-	resultMachines := make([]*v1.Node, len(regIDs))
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output", "json",
-		},
-		&resultMachines,
-	)
-	assert.Nil(t, err)
-	found := false
-	for _, node := range resultMachines {
-		if node.GetForcedTags() != nil {
-			for _, tag := range node.GetForcedTags() {
-				if tag == "tag:test" {
-					found = true
-				}
-			}
+	var listedAPIKeysAfterExpireByID []v1.ApiKey
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"apikeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedAPIKeysAfterExpireByID,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for API keys list after expire by ID")
+
+	// Verify the key was expired
+	for idx := range listedAPIKeysAfterExpireByID {
+		if listedAPIKeysAfterExpireByID[idx].GetId() == listedAPIKeysAfterDelete[0].GetId() {
+			assert.True(t, listedAPIKeysAfterExpireByID[idx].GetExpiration().AsTime().Before(time.Now()),
+				"Key expired by ID should have expiration in the past")
 		}
 	}
-	assert.Equal(
-		t,
-		true,
-		found,
-		"should find a node with the tag 'tag:test' in the list of nodes",
-	)
-}
 
-func TestNodeAdvertiseTagCommand(t *testing.T) {
-	IntegrationSkip(t)
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		policy  *policyv1.ACLPolicy
-		wantTag bool
-	}{
-		{
-			name:    "no-policy",
-			wantTag: false,
-		},
-		{
-			name: "with-policy-email",
-			policy: &policyv1.ACLPolicy{
-				ACLs: []policyv1.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				TagOwners: map[string][]string{
-					"tag:test": {"user1@test.no"},
-				},
-			},
-			wantTag: true,
-		},
-		{
-			name: "with-policy-username",
-			policy: &policyv1.ACLPolicy{
-				ACLs: []policyv1.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				TagOwners: map[string][]string{
-					"tag:test": {"user1@"},
-				},
-			},
-			wantTag: true,
-		},
-		{
-			name: "with-policy-groups",
-			policy: &policyv1.ACLPolicy{
-				Groups: policyv1.Groups{
-					"group:admins": []string{"user1@"},
-				},
-				ACLs: []policyv1.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				TagOwners: map[string][]string{
-					"tag:test": {"group:admins"},
-				},
-			},
-			wantTag: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			spec := ScenarioSpec{
-				NodesPerUser: 1,
-				Users:        []string{"user1"},
-			}
-
-			scenario, err := NewScenario(spec)
-			assertNoErr(t, err)
-			defer scenario.ShutdownAssertNoPanics(t)
-
-			err = scenario.CreateHeadscaleEnv(
-				[]tsic.Option{tsic.WithTags([]string{"tag:test"})},
-				hsic.WithTestName("cliadvtags"),
-				hsic.WithACLPolicy(tt.policy),
-			)
-			assertNoErr(t, err)
-
-			headscale, err := scenario.Headscale()
-			assertNoErr(t, err)
-
-			// Test list all nodes after added seconds
-			resultMachines := make([]*v1.Node, spec.NodesPerUser)
-			err = executeAndUnmarshal(
-				headscale,
-				[]string{
-					"headscale",
-					"nodes",
-					"list",
-					"--tags",
-					"--output", "json",
-				},
-				&resultMachines,
-			)
-			assert.Nil(t, err)
-			found := false
-			for _, node := range resultMachines {
-				if tags := node.GetValidTags(); tags != nil {
-					found = slices.Contains(tags, "tag:test")
-				}
-			}
-			assert.Equalf(
-				t,
-				tt.wantTag,
-				found,
-				"'tag:test' found(%t) is the list of nodes, expected %t", found, tt.wantTag,
-			)
+	// Test delete by ID (using key at index 1)
+	deletedKeyID := listedAPIKeysAfterExpireByID[1].GetId()
+	_, err = headscale.Execute(
+		[]string{
+			"headscale",
+			"apikeys",
+			"delete",
+			"--id",
+			strconv.FormatUint(deletedKeyID, 10),
 		})
+	require.NoError(t, err)
+
+	var listedAPIKeysAfterDeleteByID []v1.ApiKey
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(headscale,
+			[]string{
+				"headscale",
+				"apikeys",
+				"list",
+				"--output",
+				"json",
+			},
+			&listedAPIKeysAfterDeleteByID,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for API keys list after delete by ID")
+
+	assert.Len(t, listedAPIKeysAfterDeleteByID, 3)
+
+	// Verify the specific key was deleted
+	for idx := range listedAPIKeysAfterDeleteByID {
+		assert.NotEqual(t, deletedKeyID, listedAPIKeysAfterDeleteByID[idx].GetId(),
+			"Deleted key should not be present in the list")
 	}
 }
 
 func TestNodeCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	spec := ScenarioSpec{
 		Users: []string{"node-user", "other-user"},
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	regIDs := []string{
 		types.MustRegistrationID().String(),
@@ -1054,7 +1070,8 @@ func TestNodeCommand(t *testing.T) {
 		types.MustRegistrationID().String(),
 	}
 	nodes := make([]*v1.Node, len(regIDs))
-	assert.Nil(t, err)
+
+	assert.NoError(t, err)
 
 	for index, regID := range regIDs {
 		_, err := headscale.Execute(
@@ -1072,47 +1089,54 @@ func TestNodeCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		var node v1.Node
-		err = executeAndUnmarshal(
-			headscale,
-			[]string{
-				"headscale",
-				"nodes",
-				"--user",
-				"node-user",
-				"register",
-				"--key",
-				regID,
-				"--output",
-				"json",
-			},
-			&node,
-		)
-		assert.Nil(t, err)
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			err = executeAndUnmarshal(
+				headscale,
+				[]string{
+					"headscale",
+					"nodes",
+					"--user",
+					"node-user",
+					"register",
+					"--key",
+					regID,
+					"--output",
+					"json",
+				},
+				&node,
+			)
+			assert.NoError(c, err)
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for node registration")
 
 		nodes[index] = &node
 	}
 
-	assert.Len(t, nodes, len(regIDs))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		assert.Len(ct, nodes, len(regIDs), "Should have correct number of nodes after CLI operations")
+	}, 15*time.Second, 1*time.Second)
 
 	// Test list all nodes after added seconds
 	var listAll []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAll,
-	)
-	assert.Nil(t, err)
 
-	assert.Len(t, listAll, 5)
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		err := executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAll,
+		)
+		assert.NoError(ct, err)
+		assert.Len(ct, listAll, len(regIDs), "Should list all nodes after CLI operations")
+	}, 20*time.Second, 1*time.Second)
 
 	assert.Equal(t, uint64(1), listAll[0].GetId())
 	assert.Equal(t, uint64(2), listAll[1].GetId())
@@ -1131,7 +1155,8 @@ func TestNodeCommand(t *testing.T) {
 		types.MustRegistrationID().String(),
 	}
 	otherUserMachines := make([]*v1.Node, len(otherUserRegIDs))
-	assert.Nil(t, err)
+
+	assert.NoError(t, err)
 
 	for index, regID := range otherUserRegIDs {
 		_, err := headscale.Execute(
@@ -1140,7 +1165,7 @@ func TestNodeCommand(t *testing.T) {
 				"debug",
 				"create-node",
 				"--name",
-				fmt.Sprintf("otherUser-node-%d", index+1),
+				fmt.Sprintf("otheruser-node-%d", index+1),
 				"--user",
 				"other-user",
 				"--key",
@@ -1149,45 +1174,53 @@ func TestNodeCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		var node v1.Node
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			err = executeAndUnmarshal(
+				headscale,
+				[]string{
+					"headscale",
+					"nodes",
+					"--user",
+					"other-user",
+					"register",
+					"--key",
+					regID,
+					"--output",
+					"json",
+				},
+				&node,
+			)
+			assert.NoError(c, err)
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for other-user node registration")
+
+		otherUserMachines[index] = &node
+	}
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		assert.Len(ct, otherUserMachines, len(otherUserRegIDs), "Should have correct number of otherUser machines after CLI operations")
+	}, 15*time.Second, 1*time.Second)
+
+	// Test list all nodes after added otherUser
+	var listAllWithotherUser []v1.Node
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		err = executeAndUnmarshal(
 			headscale,
 			[]string{
 				"headscale",
 				"nodes",
-				"--user",
-				"other-user",
-				"register",
-				"--key",
-				regID,
+				"list",
 				"--output",
 				"json",
 			},
-			&node,
+			&listAllWithotherUser,
 		)
-		assert.Nil(t, err)
-
-		otherUserMachines[index] = &node
-	}
-
-	assert.Len(t, otherUserMachines, len(otherUserRegIDs))
-
-	// Test list all nodes after added otherUser
-	var listAllWithotherUser []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAllWithotherUser,
-	)
-	assert.Nil(t, err)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list after adding other-user nodes")
 
 	// All nodes, nodes + otherUser
 	assert.Len(t, listAllWithotherUser, 7)
@@ -1195,25 +1228,28 @@ func TestNodeCommand(t *testing.T) {
 	assert.Equal(t, uint64(6), listAllWithotherUser[5].GetId())
 	assert.Equal(t, uint64(7), listAllWithotherUser[6].GetId())
 
-	assert.Equal(t, "otherUser-node-1", listAllWithotherUser[5].GetName())
-	assert.Equal(t, "otherUser-node-2", listAllWithotherUser[6].GetName())
+	assert.Equal(t, "otheruser-node-1", listAllWithotherUser[5].GetName())
+	assert.Equal(t, "otheruser-node-2", listAllWithotherUser[6].GetName())
 
 	// Test list all nodes after added otherUser
 	var listOnlyotherUserMachineUser []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--user",
-			"other-user",
-			"--output",
-			"json",
-		},
-		&listOnlyotherUserMachineUser,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--user",
+				"other-user",
+				"--output",
+				"json",
+			},
+			&listOnlyotherUserMachineUser,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list filtered by other-user")
 
 	assert.Len(t, listOnlyotherUserMachineUser, 2)
 
@@ -1222,12 +1258,12 @@ func TestNodeCommand(t *testing.T) {
 
 	assert.Equal(
 		t,
-		"otherUser-node-1",
+		"otheruser-node-1",
 		listOnlyotherUserMachineUser[0].GetName(),
 	)
 	assert.Equal(
 		t,
-		"otherUser-node-2",
+		"otheruser-node-2",
 		listOnlyotherUserMachineUser[1].GetName(),
 	)
 
@@ -1245,45 +1281,47 @@ func TestNodeCommand(t *testing.T) {
 			"--force",
 		},
 	)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// Test: list main user after node is deleted
 	var listOnlyMachineUserAfterDelete []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--user",
-			"node-user",
-			"--output",
-			"json",
-		},
-		&listOnlyMachineUserAfterDelete,
-	)
-	assert.Nil(t, err)
 
-	assert.Len(t, listOnlyMachineUserAfterDelete, 4)
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		err := executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--user",
+				"node-user",
+				"--output",
+				"json",
+			},
+			&listOnlyMachineUserAfterDelete,
+		)
+		assert.NoError(ct, err)
+		assert.Len(ct, listOnlyMachineUserAfterDelete, 4, "Should have 4 nodes for node-user after deletion")
+	}, 20*time.Second, 1*time.Second)
 }
 
 func TestNodeExpireCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	spec := ScenarioSpec{
 		Users: []string{"node-expire-user"},
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	regIDs := []string{
 		types.MustRegistrationID().String(),
@@ -1310,25 +1348,28 @@ func TestNodeExpireCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		var node v1.Node
-		err = executeAndUnmarshal(
-			headscale,
-			[]string{
-				"headscale",
-				"nodes",
-				"--user",
-				"node-expire-user",
-				"register",
-				"--key",
-				regID,
-				"--output",
-				"json",
-			},
-			&node,
-		)
-		assert.Nil(t, err)
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			err = executeAndUnmarshal(
+				headscale,
+				[]string{
+					"headscale",
+					"nodes",
+					"--user",
+					"node-expire-user",
+					"register",
+					"--key",
+					regID,
+					"--output",
+					"json",
+				},
+				&node,
+			)
+			assert.NoError(c, err)
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for node-expire-user node registration")
 
 		nodes[index] = &node
 	}
@@ -1336,18 +1377,21 @@ func TestNodeExpireCommand(t *testing.T) {
 	assert.Len(t, nodes, len(regIDs))
 
 	var listAll []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAll,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAll,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list in expire test")
 
 	assert.Len(t, listAll, 5)
 
@@ -1364,25 +1408,28 @@ func TestNodeExpireCommand(t *testing.T) {
 				"nodes",
 				"expire",
 				"--identifier",
-				fmt.Sprintf("%d", listAll[idx].GetId()),
+				strconv.FormatUint(listAll[idx].GetId(), 10),
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 
 	var listAllAfterExpiry []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAllAfterExpiry,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAllAfterExpiry,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list after expiry")
 
 	assert.Len(t, listAllAfterExpiry, 5)
 
@@ -1395,21 +1442,21 @@ func TestNodeExpireCommand(t *testing.T) {
 
 func TestNodeRenameCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	spec := ScenarioSpec{
 		Users: []string{"node-rename-command"},
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	regIDs := []string{
 		types.MustRegistrationID().String(),
@@ -1419,7 +1466,8 @@ func TestNodeRenameCommand(t *testing.T) {
 		types.MustRegistrationID().String(),
 	}
 	nodes := make([]*v1.Node, len(regIDs))
-	assert.Nil(t, err)
+
+	assert.NoError(t, err)
 
 	for index, regID := range regIDs {
 		_, err := headscale.Execute(
@@ -1437,25 +1485,28 @@ func TestNodeRenameCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assertNoErr(t, err)
+		require.NoError(t, err)
 
 		var node v1.Node
-		err = executeAndUnmarshal(
-			headscale,
-			[]string{
-				"headscale",
-				"nodes",
-				"--user",
-				"node-rename-command",
-				"register",
-				"--key",
-				regID,
-				"--output",
-				"json",
-			},
-			&node,
-		)
-		assertNoErr(t, err)
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			err = executeAndUnmarshal(
+				headscale,
+				[]string{
+					"headscale",
+					"nodes",
+					"--user",
+					"node-rename-command",
+					"register",
+					"--key",
+					regID,
+					"--output",
+					"json",
+				},
+				&node,
+			)
+			assert.NoError(c, err)
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for node-rename-command node registration")
 
 		nodes[index] = &node
 	}
@@ -1463,18 +1514,21 @@ func TestNodeRenameCommand(t *testing.T) {
 	assert.Len(t, nodes, len(regIDs))
 
 	var listAll []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAll,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAll,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list in rename test")
 
 	assert.Len(t, listAll, 5)
 
@@ -1491,28 +1545,31 @@ func TestNodeRenameCommand(t *testing.T) {
 				"nodes",
 				"rename",
 				"--identifier",
-				fmt.Sprintf("%d", listAll[idx].GetId()),
+				strconv.FormatUint(listAll[idx].GetId(), 10),
 				fmt.Sprintf("newnode-%d", idx+1),
 			},
 		)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		assert.Contains(t, res, "Node renamed")
 	}
 
 	var listAllAfterRename []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAllAfterRename,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAllAfterRename,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list after rename")
 
 	assert.Len(t, listAllAfterRename, 5)
 
@@ -1529,25 +1586,28 @@ func TestNodeRenameCommand(t *testing.T) {
 			"nodes",
 			"rename",
 			"--identifier",
-			fmt.Sprintf("%d", listAll[4].GetId()),
+			strconv.FormatUint(listAll[4].GetId(), 10),
 			strings.Repeat("t", 64),
 		},
 	)
-	assert.ErrorContains(t, err, "not be over 63 chars")
+	assert.ErrorContains(t, err, "must not exceed 63 characters")
 
 	var listAllAfterRenameAttempt []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&listAllAfterRenameAttempt,
-	)
-	assert.Nil(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"nodes",
+				"list",
+				"--output",
+				"json",
+			},
+			&listAllAfterRenameAttempt,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for nodes list after failed rename attempt")
 
 	assert.Len(t, listAllAfterRenameAttempt, 5)
 
@@ -1558,176 +1618,16 @@ func TestNodeRenameCommand(t *testing.T) {
 	assert.Contains(t, listAllAfterRenameAttempt[4].GetGivenName(), "node-5")
 }
 
-func TestNodeMoveCommand(t *testing.T) {
-	IntegrationSkip(t)
-	t.Parallel()
-
-	spec := ScenarioSpec{
-		Users: []string{"old-user", "new-user"},
-	}
-
-	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
-	defer scenario.ShutdownAssertNoPanics(t)
-
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
-	assertNoErr(t, err)
-
-	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
-
-	// Randomly generated node key
-	regID := types.MustRegistrationID()
-
-	_, err = headscale.Execute(
-		[]string{
-			"headscale",
-			"debug",
-			"create-node",
-			"--name",
-			"nomad-node",
-			"--user",
-			"old-user",
-			"--key",
-			regID.String(),
-			"--output",
-			"json",
-		},
-	)
-	assert.Nil(t, err)
-
-	var node v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"--user",
-			"old-user",
-			"register",
-			"--key",
-			regID.String(),
-			"--output",
-			"json",
-		},
-		&node,
-	)
-	assert.Nil(t, err)
-
-	assert.Equal(t, uint64(1), node.GetId())
-	assert.Equal(t, "nomad-node", node.GetName())
-	assert.Equal(t, node.GetUser().GetName(), "old-user")
-
-	nodeID := fmt.Sprintf("%d", node.GetId())
-
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"move",
-			"--identifier",
-			nodeID,
-			"--user",
-			"new-user",
-			"--output",
-			"json",
-		},
-		&node,
-	)
-	assert.Nil(t, err)
-
-	assert.Equal(t, node.GetUser().GetName(), "new-user")
-
-	var allNodes []v1.Node
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"list",
-			"--output",
-			"json",
-		},
-		&allNodes,
-	)
-	assert.Nil(t, err)
-
-	assert.Len(t, allNodes, 1)
-
-	assert.Equal(t, allNodes[0].GetId(), node.GetId())
-	assert.Equal(t, allNodes[0].GetUser(), node.GetUser())
-	assert.Equal(t, allNodes[0].GetUser().GetName(), "new-user")
-
-	_, err = headscale.Execute(
-		[]string{
-			"headscale",
-			"nodes",
-			"move",
-			"--identifier",
-			nodeID,
-			"--user",
-			"non-existing-user",
-			"--output",
-			"json",
-		},
-	)
-	assert.ErrorContains(
-		t,
-		err,
-		"user not found",
-	)
-	assert.Equal(t, node.GetUser().GetName(), "new-user")
-
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"move",
-			"--identifier",
-			nodeID,
-			"--user",
-			"old-user",
-			"--output",
-			"json",
-		},
-		&node,
-	)
-	assert.Nil(t, err)
-
-	assert.Equal(t, node.GetUser().GetName(), "old-user")
-
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"nodes",
-			"move",
-			"--identifier",
-			nodeID,
-			"--user",
-			"old-user",
-			"--output",
-			"json",
-		},
-		&node,
-	)
-	assert.Nil(t, err)
-
-	assert.Equal(t, node.GetUser().GetName(), "old-user")
-}
-
 func TestPolicyCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	spec := ScenarioSpec{
 		Users: []string{"user1"},
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv(
@@ -1737,21 +1637,24 @@ func TestPolicyCommand(t *testing.T) {
 			"HEADSCALE_POLICY_MODE": "database",
 		}),
 	)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
-	p := policyv1.ACLPolicy{
-		ACLs: []policyv1.ACL{
+	p := policyv2.Policy{
+		ACLs: []policyv2.ACL{
 			{
-				Action:       "accept",
-				Sources:      []string{"*"},
-				Destinations: []string{"*:*"},
+				Action:   "accept",
+				Protocol: "tcp",
+				Sources:  []policyv2.Alias{wildcard()},
+				Destinations: []policyv2.AliasWithPorts{
+					aliasWithPorts(wildcard(), tailcfg.PortRangeAny),
+				},
 			},
 		},
-		TagOwners: map[string][]string{
-			"tag:exists": {"user1@"},
+		TagOwners: policyv2.TagOwners{
+			policyv2.Tag("tag:exists"): policyv2.Owners{usernameOwner("user1@")},
 		},
 	}
 
@@ -1760,7 +1663,7 @@ func TestPolicyCommand(t *testing.T) {
 	policyFilePath := "/etc/headscale/policy.json"
 
 	err = headscale.WriteFile(policyFilePath, pBytes)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	// No policy is present at this time.
 	// Add a new policy from a file.
@@ -1774,23 +1677,26 @@ func TestPolicyCommand(t *testing.T) {
 		},
 	)
 
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	// Get the current policy and check
 	// if it is the same as the one we set.
-	var output *policyv1.ACLPolicy
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"policy",
-			"get",
-			"--output",
-			"json",
-		},
-		&output,
-	)
-	assertNoErr(t, err)
+	var output *policyv2.Policy
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"policy",
+				"get",
+				"--output",
+				"json",
+			},
+			&output,
+		)
+		assert.NoError(c, err)
+	}, 10*time.Second, 200*time.Millisecond, "Waiting for policy get command")
 
 	assert.Len(t, output.TagOwners, 1)
 	assert.Len(t, output.ACLs, 1)
@@ -1798,7 +1704,6 @@ func TestPolicyCommand(t *testing.T) {
 
 func TestPolicyBrokenConfigCommand(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	spec := ScenarioSpec{
 		NodesPerUser: 1,
@@ -1806,7 +1711,8 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 	}
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+
+	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv(
@@ -1816,23 +1722,26 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 			"HEADSCALE_POLICY_MODE": "database",
 		}),
 	)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
-	p := policyv1.ACLPolicy{
-		ACLs: []policyv1.ACL{
+	p := policyv2.Policy{
+		ACLs: []policyv2.ACL{
 			{
 				// This is an unknown action, so it will return an error
 				// and the config will not be applied.
-				Action:       "unknown-action",
-				Sources:      []string{"*"},
-				Destinations: []string{"*:*"},
+				Action:   "unknown-action",
+				Protocol: "tcp",
+				Sources:  []policyv2.Alias{wildcard()},
+				Destinations: []policyv2.AliasWithPorts{
+					aliasWithPorts(wildcard(), tailcfg.PortRangeAny),
+				},
 			},
 		},
-		TagOwners: map[string][]string{
-			"tag:exists": {"user1@"},
+		TagOwners: policyv2.TagOwners{
+			policyv2.Tag("tag:exists"): policyv2.Owners{usernameOwner("user1@")},
 		},
 	}
 
@@ -1841,7 +1750,7 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 	policyFilePath := "/etc/headscale/policy.json"
 
 	err = headscale.WriteFile(policyFilePath, pBytes)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	// No policy is present at this time.
 	// Add a new policy from a file.
@@ -1854,7 +1763,7 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 			policyFilePath,
 		},
 	)
-	assert.ErrorContains(t, err, "compiling filter rules: invalid action")
+	assert.ErrorContains(t, err, `invalid action "unknown-action"`)
 
 	// The new policy was invalid, the old one should still be in place, which
 	// is none.

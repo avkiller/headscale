@@ -13,7 +13,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
-	"gorm.io/gorm"
 	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlhttp/controlhttpserver"
 	"tailscale.com/tailcfg"
@@ -30,9 +29,6 @@ const (
 	// of length. Then that many bytes of JSON-encoded tailcfg.EarlyNoise.
 	// The early payload is optional. Some servers may not send it... But we do!
 	earlyPayloadMagic = "\xff\xff\xffTS"
-
-	// EarlyNoise was added in protocol version 49.
-	earlyNoiseCapabilityVersion = 49
 )
 
 type noiseServer struct {
@@ -100,6 +96,10 @@ func (h *Headscale) NoiseUpgradeHandler(
 
 	router.HandleFunc("/machine/register", noiseServer.NoiseRegistrationHandler).
 		Methods(http.MethodPost)
+
+	// Endpoints outside of the register endpoint must use getAndValidateNode to
+	// get the node to ensure that the MachineKey matches the Node setting up the
+	// connection.
 	router.HandleFunc("/machine/map", noiseServer.NoisePollNetMapHandler)
 
 	noiseServer.httpBaseConfig = &http.Server{
@@ -172,8 +172,8 @@ func rejectUnsupported(
 			Int("client_cap_ver", int(version)).
 			Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
 			Str("client_version", capver.TailscaleVersion(version)).
-			Str("node_key", nkey.ShortString()).
-			Str("machine_key", mkey.ShortString()).
+			Str("node.key", nkey.ShortString()).
+			Str("machine.key", mkey.ShortString()).
 			Msg("unsupported client connected")
 		http.Error(writer, unsupportedClientError(version).Error(), http.StatusBadRequest)
 
@@ -209,19 +209,15 @@ func (ns *noiseServer) NoisePollNetMapHandler(
 		return
 	}
 
-	ns.nodeKey = mapRequest.NodeKey
-
-	node, err := ns.headscale.db.GetNodeByNodeKey(mapRequest.NodeKey)
+	nv, err := ns.getAndValidateNode(mapRequest)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", nil))
-			return
-		}
 		httpError(writer, err)
 		return
 	}
 
-	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, node)
+	ns.nodeKey = nv.NodeKey()
+
+	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, nv.AsStruct())
 	sess.tracef("a node sending a MapRequest with Noise protocol")
 	if !sess.isStreaming() {
 		sess.serve()
@@ -266,8 +262,8 @@ func (ns *noiseServer) NoiseRegistrationHandler(
 					Error: httpErr.Msg,
 				}
 				return &regReq, resp
-			} else {
 			}
+
 			return &regReq, regErr(err)
 		}
 
@@ -279,13 +275,32 @@ func (ns *noiseServer) NoiseRegistrationHandler(
 		return
 	}
 
-	respBody, err := json.Marshal(registerResponse)
-	if err != nil {
-		httpError(writer, err)
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+
+	if err := json.NewEncoder(writer).Encode(registerResponse); err != nil {
+		log.Error().Caller().Err(err).Msg("NoiseRegistrationHandler: failed to encode RegisterResponse")
 		return
 	}
 
-	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
-	writer.Write(respBody)
+	// Ensure response is flushed to client
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// getAndValidateNode retrieves the node from the database using the NodeKey
+// and validates that it matches the MachineKey from the Noise session.
+func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
+	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)
+	if !ok {
+		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", nil)
+	}
+
+	// Validate that the MachineKey in the Noise session matches the one associated with the NodeKey.
+	if ns.machineKey != nv.MachineKey() {
+		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node key in request does not match the one associated with this machine key", nil)
+	}
+
+	return nv, nil
 }

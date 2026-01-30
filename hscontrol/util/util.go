@@ -1,15 +1,18 @@
 package util
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"tailscale.com/tailcfg"
 	"tailscale.com/util/cmpver"
 )
 
@@ -52,52 +55,56 @@ func ParseLoginURLFromCLILogin(output string) (*url.URL, error) {
 }
 
 type TraceroutePath struct {
-  // Hop is the current jump in the total traceroute.
-  Hop int
+	// Hop is the current jump in the total traceroute.
+	Hop int
 
-  // Hostname is the resolved hostname or IP address identifying the jump
-  Hostname string
+	// Hostname is the resolved hostname or IP address identifying the jump
+	Hostname string
 
-  // IP is the IP address of the jump
-  IP netip.Addr
+	// IP is the IP address of the jump
+	IP netip.Addr
 
-  // Latencies is a list of the latencies for this jump
-  Latencies []time.Duration
+	// Latencies is a list of the latencies for this jump
+	Latencies []time.Duration
 }
 
 type Traceroute struct {
-  // Hostname is the resolved hostname or IP address identifying the target
-  Hostname string
+	// Hostname is the resolved hostname or IP address identifying the target
+	Hostname string
 
-  // IP is the IP address of the target
-  IP netip.Addr
+	// IP is the IP address of the target
+	IP netip.Addr
 
-  // Route is the path taken to reach the target if successful. The list is ordered by the path taken.
-  Route []TraceroutePath
+	// Route is the path taken to reach the target if successful. The list is ordered by the path taken.
+	Route []TraceroutePath
 
-  // Success indicates if the traceroute was successful.
-  Success bool
+	// Success indicates if the traceroute was successful.
+	Success bool
 
-  // Err contains an error if  the traceroute was not successful.
-  Err error
+	// Err contains an error if  the traceroute was not successful.
+	Err error
 }
 
-// ParseTraceroute parses the output of the traceroute command and returns a Traceroute struct
+// ParseTraceroute parses the output of the traceroute command and returns a Traceroute struct.
 func ParseTraceroute(output string) (Traceroute, error) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) < 1 {
 		return Traceroute{}, errors.New("empty traceroute output")
 	}
 
-	// Parse the header line
-	headerRegex := regexp.MustCompile(`traceroute to ([^ ]+) \(([^)]+)\)`)
+	// Parse the header line - handle both 'traceroute' and 'tracert' (Windows)
+	headerRegex := regexp.MustCompile(`(?i)(?:traceroute|tracing route) to ([^ ]+) (?:\[([^\]]+)\]|\(([^)]+)\))`)
 	headerMatches := headerRegex.FindStringSubmatch(lines[0])
-	if len(headerMatches) != 3 {
+	if len(headerMatches) < 2 {
 		return Traceroute{}, fmt.Errorf("parsing traceroute header: %s", lines[0])
 	}
 
 	hostname := headerMatches[1]
+	// IP can be in either capture group 2 or 3 depending on format
 	ipStr := headerMatches[2]
+	if ipStr == "" {
+		ipStr = headerMatches[3]
+	}
 	ip, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return Traceroute{}, fmt.Errorf("parsing IP address %s: %w", ipStr, err)
@@ -110,44 +117,112 @@ func ParseTraceroute(output string) (Traceroute, error) {
 		Success:  false,
 	}
 
-	// Parse each hop line
-	hopRegex := regexp.MustCompile(`^\s*(\d+)\s+(?:([^ ]+) \(([^)]+)\)|(\*))(?:\s+(\d+\.\d+) ms)?(?:\s+(\d+\.\d+) ms)?(?:\s+(\d+\.\d+) ms)?`)
+	// More flexible regex that handles various traceroute output formats
+	// Main pattern handles: "hostname (IP)", "hostname [IP]", "IP only", "* * *"
+	hopRegex := regexp.MustCompile(`^\s*(\d+)\s+(.*)$`)
+	// Patterns for parsing the hop details
+	hostIPRegex := regexp.MustCompile(`^([^ ]+) \(([^)]+)\)`)
+	hostIPBracketRegex := regexp.MustCompile(`^([^ ]+) \[([^\]]+)\]`)
+	// Pattern for latencies with flexible spacing and optional '<'
+	latencyRegex := regexp.MustCompile(`(<?\d+(?:\.\d+)?)\s*ms\b`)
 
 	for i := 1; i < len(lines); i++ {
-		matches := hopRegex.FindStringSubmatch(lines[i])
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+
+		matches := hopRegex.FindStringSubmatch(line)
 		if len(matches) == 0 {
 			continue
 		}
 
 		hop, err := strconv.Atoi(matches[1])
 		if err != nil {
-			return Traceroute{}, fmt.Errorf("parsing hop number: %w", err)
+			// Skip lines that don't start with a hop number
+			continue
 		}
 
+		remainder := strings.TrimSpace(matches[2])
 		var hopHostname string
 		var hopIP netip.Addr
 		var latencies []time.Duration
 
-		// Handle hostname and IP
-		if matches[2] != "" && matches[3] != "" {
-			hopHostname = matches[2]
-			hopIP, err = netip.ParseAddr(matches[3])
-			if err != nil {
-				return Traceroute{}, fmt.Errorf("parsing hop IP address %s: %w", matches[3], err)
+		// Check for Windows tracert format which has latencies before hostname
+		// Format: "  1    <1 ms    <1 ms    <1 ms  router.local [192.168.1.1]"
+		latencyFirst := false
+		if strings.Contains(remainder, " ms ") && !strings.HasPrefix(remainder, "*") {
+			// Check if latencies appear before any hostname/IP
+			firstSpace := strings.Index(remainder, " ")
+			if firstSpace > 0 {
+				firstPart := remainder[:firstSpace]
+				if _, err := strconv.ParseFloat(strings.TrimPrefix(firstPart, "<"), 64); err == nil {
+					latencyFirst = true
+				}
 			}
-		} else if matches[4] == "*" {
-			hopHostname = "*"
-			// No IP for timeouts
 		}
 
-		// Parse latencies
-		for j := 5; j <= 7; j++ {
-			if matches[j] != "" {
-				ms, err := strconv.ParseFloat(matches[j], 64)
-				if err != nil {
-					return Traceroute{}, fmt.Errorf("parsing latency: %w", err)
+		if latencyFirst {
+			// Windows format: extract latencies first
+			for {
+				latMatch := latencyRegex.FindStringSubmatchIndex(remainder)
+				if latMatch == nil || latMatch[0] > 0 {
+					break
 				}
-				latencies = append(latencies, time.Duration(ms*float64(time.Millisecond)))
+				// Extract and remove the latency from the beginning
+				latStr := strings.TrimPrefix(remainder[latMatch[2]:latMatch[3]], "<")
+				ms, err := strconv.ParseFloat(latStr, 64)
+				if err == nil {
+					// Round to nearest microsecond to avoid floating point precision issues
+					duration := time.Duration(ms * float64(time.Millisecond))
+					latencies = append(latencies, duration.Round(time.Microsecond))
+				}
+				remainder = strings.TrimSpace(remainder[latMatch[1]:])
+			}
+		}
+
+		// Now parse hostname/IP from remainder
+		if strings.HasPrefix(remainder, "*") {
+			// Timeout hop
+			hopHostname = "*"
+			// Skip any remaining asterisks
+			remainder = strings.TrimLeft(remainder, "* ")
+		} else if hostMatch := hostIPRegex.FindStringSubmatch(remainder); len(hostMatch) >= 3 {
+			// Format: hostname (IP)
+			hopHostname = hostMatch[1]
+			hopIP, _ = netip.ParseAddr(hostMatch[2])
+			remainder = strings.TrimSpace(remainder[len(hostMatch[0]):])
+		} else if hostMatch := hostIPBracketRegex.FindStringSubmatch(remainder); len(hostMatch) >= 3 {
+			// Format: hostname [IP] (Windows)
+			hopHostname = hostMatch[1]
+			hopIP, _ = netip.ParseAddr(hostMatch[2])
+			remainder = strings.TrimSpace(remainder[len(hostMatch[0]):])
+		} else {
+			// Try to parse as IP only or hostname only
+			parts := strings.Fields(remainder)
+			if len(parts) > 0 {
+				hopHostname = parts[0]
+				if ip, err := netip.ParseAddr(parts[0]); err == nil {
+					hopIP = ip
+				}
+				remainder = strings.TrimSpace(strings.Join(parts[1:], " "))
+			}
+		}
+
+		// Extract latencies from the remaining part (if not already done)
+		if !latencyFirst {
+			latencyMatches := latencyRegex.FindAllStringSubmatch(remainder, -1)
+			for _, match := range latencyMatches {
+				if len(match) > 1 {
+					// Remove '<' prefix if present (e.g., "<1 ms")
+					latStr := strings.TrimPrefix(match[1], "<")
+					ms, err := strconv.ParseFloat(latStr, 64)
+					if err == nil {
+						// Round to nearest microsecond to avoid floating point precision issues
+						duration := time.Duration(ms * float64(time.Millisecond))
+						latencies = append(latencies, duration.Round(time.Microsecond))
+					}
+				}
 			}
 		}
 
@@ -172,4 +247,67 @@ func ParseTraceroute(output string) (Traceroute, error) {
 	}
 
 	return result, nil
+}
+
+func IsCI() bool {
+	if _, ok := os.LookupEnv("CI"); ok {
+		return true
+	}
+
+	if _, ok := os.LookupEnv("GITHUB_RUN_ID"); ok {
+		return true
+	}
+
+	return false
+}
+
+// SafeHostname extracts a hostname from Hostinfo, providing sensible defaults
+// if Hostinfo is nil or Hostname is empty. This prevents nil pointer dereferences
+// and ensures nodes always have a valid hostname.
+// The hostname is truncated to 63 characters to comply with DNS label length limits (RFC 1123).
+// EnsureHostname guarantees a valid hostname for node registration.
+// This function never fails - it always returns a valid hostname.
+//
+// Strategy:
+// 1. If hostinfo is nil/empty → generate default from keys
+// 2. If hostname is provided → normalise it
+// 3. If normalisation fails → generate invalid-<random> replacement
+//
+// Returns the guaranteed-valid hostname to use.
+func EnsureHostname(hostinfo *tailcfg.Hostinfo, machineKey, nodeKey string) string {
+	if hostinfo == nil || hostinfo.Hostname == "" {
+		key := cmp.Or(machineKey, nodeKey)
+		if key == "" {
+			return "unknown-node"
+		}
+		keyPrefix := key
+		if len(key) > 8 {
+			keyPrefix = key[:8]
+		}
+		return fmt.Sprintf("node-%s", keyPrefix)
+	}
+
+	lowercased := strings.ToLower(hostinfo.Hostname)
+	if err := ValidateHostname(lowercased); err == nil {
+		return lowercased
+	}
+
+	return InvalidString()
+}
+
+// GenerateRegistrationKey generates a vanity key for tracking web authentication
+// registration flows in logs. This key is NOT stored in the database and does NOT use bcrypt -
+// it's purely for observability and correlating log entries during the registration process.
+func GenerateRegistrationKey() (string, error) {
+	const (
+		registerKeyPrefix = "hskey-reg-" //nolint:gosec // This is a vanity key for logging, not a credential
+		registerKeyLength = 64
+	)
+
+	randomPart, err := GenerateRandomStringURLSafe(registerKeyLength)
+	if err != nil {
+		return "", fmt.Errorf("generating registration key: %w", err)
+	}
+
+	return registerKeyPrefix + randomPart, nil
 }

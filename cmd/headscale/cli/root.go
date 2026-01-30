@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
+	"strings"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
@@ -22,6 +24,11 @@ var cfgFile string = ""
 func init() {
 	if len(os.Args) > 1 &&
 		(os.Args[1] == "version" || os.Args[1] == "mockoidc" || os.Args[1] == "completion") {
+		return
+	}
+
+	if slices.Contains(os.Args, "policy") && slices.Contains(os.Args, "check") {
+		zerolog.SetGlobalLevel(zerolog.Disabled)
 		return
 	}
 
@@ -60,27 +67,66 @@ func initConfig() {
 
 	logFormat := viper.GetString("log.format")
 	if logFormat == types.JSONLogFormat {
-	 	log.Logger = log.Output(os.Stdout)
+		log.Logger = log.Output(os.Stdout)
 	}
 
 	disableUpdateCheck := viper.GetBool("disable_check_updates")
 	if !disableUpdateCheck && !machineOutput {
+		versionInfo := types.GetVersionInfo()
 		if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") &&
-			types.Version != "dev" {
+			!versionInfo.Dirty {
 			githubTag := &latest.GithubTag{
-				Owner:      "juanfont",
-				Repository: "headscale",
+				Owner:         "juanfont",
+				Repository:    "headscale",
+				TagFilterFunc: filterPreReleasesIfStable(func() string { return versionInfo.Version }),
 			}
-			res, err := latest.Check(githubTag, types.Version)
+			res, err := latest.Check(githubTag, versionInfo.Version)
 			if err == nil && res.Outdated {
 				//nolint
 				log.Warn().Msgf(
 					"An updated version of Headscale has been found (%s vs. your current %s). Check it out https://github.com/juanfont/headscale/releases\n",
 					res.Current,
-					types.Version,
+					versionInfo.Version,
 				)
 			}
 		}
+	}
+}
+
+var prereleases = []string{"alpha", "beta", "rc", "dev"}
+
+func isPreReleaseVersion(version string) bool {
+	for _, unstable := range prereleases {
+		if strings.Contains(version, unstable) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterPreReleasesIfStable returns a function that filters out
+// pre-release tags if the current version is stable.
+// If the current version is a pre-release, it does not filter anything.
+// versionFunc is a function that returns the current version string, it is
+// a func for testability.
+func filterPreReleasesIfStable(versionFunc func() string) func(string) bool {
+	return func(tag string) bool {
+		version := versionFunc()
+
+		// If we are on a pre-release version, then we do not filter anything
+		// as we want to recommend the user the latest pre-release.
+		if isPreReleaseVersion(version) {
+			return false
+		}
+
+		// If we are on a stable release, filter out pre-releases.
+		for _, ignore := range prereleases {
+			if strings.Contains(tag, ignore) {
+				return true
+			}
+		}
+
+		return false
 	}
 }
 

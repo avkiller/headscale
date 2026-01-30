@@ -28,6 +28,8 @@ const (
 	maxDuration           time.Duration = 1<<63 - 1
 	PKCEMethodPlain       string        = "plain"
 	PKCEMethodS256        string        = "S256"
+
+	defaultNodeStoreBatchSize = 100
 )
 
 var (
@@ -92,6 +94,7 @@ type Config struct {
 
 	LogTail             LogTailConfig
 	RandomizeClientPort bool
+	Taildrop            TaildropConfig
 
 	CLI CLIConfig
 
@@ -182,6 +185,7 @@ type OIDCConfig struct {
 	AllowedDomains             []string
 	AllowedUsers               []string
 	AllowedGroups              []string
+	EmailVerifiedRequired      bool
 	Expiry                     time.Duration
 	UseExpiryFromToken         bool
 	PKCE                       PKCEConfig
@@ -194,6 +198,7 @@ type DERPConfig struct {
 	ServerRegionCode                   string
 	ServerRegionName                   string
 	ServerPrivateKeyPath               string
+	ServerVerifyClients                bool
 	STUNAddr                           string
 	URLs                               []url.URL
 	Paths                              []string
@@ -205,6 +210,10 @@ type DERPConfig struct {
 }
 
 type LogTailConfig struct {
+	Enabled bool
+}
+
+type TaildropConfig struct {
 	Enabled bool
 }
 
@@ -229,10 +238,63 @@ type LogConfig struct {
 	Level  zerolog.Level
 }
 
+// Tuning contains advanced performance tuning parameters for Headscale.
+// These settings control internal batching, timeouts, and resource allocation.
+// The defaults are carefully chosen for typical deployments and should rarely
+// need adjustment. Changes to these values can significantly impact performance
+// and resource usage.
 type Tuning struct {
-	NotifierSendTimeout            time.Duration
-	BatchChangeDelay               time.Duration
+	// NotifierSendTimeout is the maximum time to wait when sending notifications
+	// to connected clients about network changes.
+	NotifierSendTimeout time.Duration
+
+	// BatchChangeDelay controls how long to wait before sending batched updates
+	// to clients when multiple changes occur in rapid succession.
+	BatchChangeDelay time.Duration
+
+	// NodeMapSessionBufferedChanSize sets the buffer size for the channel that
+	// queues map updates to be sent to connected clients.
 	NodeMapSessionBufferedChanSize int
+
+	// BatcherWorkers controls the number of parallel workers processing map
+	// updates for connected clients.
+	BatcherWorkers int
+
+	// RegisterCacheCleanup is the interval between cleanup operations for
+	// expired registration cache entries.
+	RegisterCacheCleanup time.Duration
+
+	// RegisterCacheExpiration is how long registration cache entries remain
+	// valid before being eligible for cleanup.
+	RegisterCacheExpiration time.Duration
+
+	// NodeStoreBatchSize controls how many write operations are accumulated
+	// before rebuilding the in-memory node snapshot.
+	//
+	// The NodeStore batches write operations (add/update/delete nodes) before
+	// rebuilding its in-memory data structures. Rebuilding involves recalculating
+	// peer relationships between all nodes based on the current ACL policy, which
+	// is computationally expensive and scales with the square of the number of nodes.
+	//
+	// By batching writes, Headscale can process N operations but only rebuild once,
+	// rather than rebuilding N times. This significantly reduces CPU usage during
+	// bulk operations like initial sync or policy updates.
+	//
+	// Trade-off: Higher values reduce CPU usage from rebuilds but increase latency
+	// for individual operations waiting for their batch to complete.
+	NodeStoreBatchSize int
+
+	// NodeStoreBatchTimeout is the maximum time to wait before processing a
+	// partial batch of node operations.
+	//
+	// When NodeStoreBatchSize operations haven't accumulated, this timeout ensures
+	// writes don't wait indefinitely. The batch processes when either the size
+	// threshold is reached OR this timeout expires, whichever comes first.
+	//
+	// Trade-off: Lower values provide faster response for individual operations
+	// but trigger more frequent (expensive) peer map rebuilds. Higher values
+	// optimize for bulk throughput at the cost of individual operation latency.
+	NodeStoreBatchTimeout time.Duration
 }
 
 func validatePKCEMethod(method string) error {
@@ -295,8 +357,10 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.search_domains", []string{})
 
 	viper.SetDefault("derp.server.enabled", false)
+	viper.SetDefault("derp.server.verify_clients", true)
 	viper.SetDefault("derp.server.stun.enabled", true)
 	viper.SetDefault("derp.server.automatically_add_embedded_derp_region", true)
+	viper.SetDefault("derp.update_frequency", "3h")
 
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
 	viper.SetDefault("unix_socket_permission", "0o770")
@@ -321,19 +385,28 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("oidc.use_expiry_from_token", false)
 	viper.SetDefault("oidc.pkce.enabled", false)
 	viper.SetDefault("oidc.pkce.method", "S256")
+	viper.SetDefault("oidc.email_verified_required", true)
 
 	viper.SetDefault("logtail.enabled", false)
 	viper.SetDefault("randomize_client_port", false)
+	viper.SetDefault("taildrop.enabled", true)
 
 	viper.SetDefault("ephemeral_node_inactivity_timeout", "120s")
 
 	viper.SetDefault("tuning.notifier_send_timeout", "800ms")
 	viper.SetDefault("tuning.batch_change_delay", "800ms")
 	viper.SetDefault("tuning.node_mapsession_buffered_chan_size", 30)
+	viper.SetDefault("tuning.node_store_batch_size", defaultNodeStoreBatchSize)
+	viper.SetDefault("tuning.node_store_batch_timeout", "500ms")
 
 	viper.SetDefault("prefixes.allocation", string(IPAllocationStrategySequential))
 
 	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			log.Warn().Msg("No config file found, using defaults")
+			return nil
+		}
+
 		return fmt.Errorf("fatal error reading config file: %w", err)
 	}
 
@@ -387,7 +460,7 @@ func validateServerConfig() error {
 		errorText += "Fatal config error: set either tls_letsencrypt_hostname or tls_cert_path/tls_key_path, not both\n"
 	}
 
-	if !viper.IsSet("noise") || viper.GetString("noise.private_key_path") == "" {
+	if viper.GetString("noise.private_key_path") == "" {
 		errorText += "Fatal config error: headscale now requires a new `noise.private_key_path` field in the config file for the Tailscale v2 protocol\n"
 	}
 
@@ -426,6 +499,21 @@ func validateServerConfig() error {
 		}
 	}
 
+	// Validate tuning parameters
+	if size := viper.GetInt("tuning.node_store_batch_size"); size <= 0 {
+		errorText += fmt.Sprintf(
+			"Fatal config error: tuning.node_store_batch_size must be positive, got %d\n",
+			size,
+		)
+	}
+
+	if timeout := viper.GetDuration("tuning.node_store_batch_timeout"); timeout <= 0 {
+		errorText += fmt.Sprintf(
+			"Fatal config error: tuning.node_store_batch_timeout must be positive, got %s\n",
+			timeout,
+		)
+	}
+
 	if errorText != "" {
 		// nolint
 		return errors.New(strings.TrimSuffix(errorText, "\n"))
@@ -458,6 +546,7 @@ func derpConfig() DERPConfig {
 	serverRegionID := viper.GetInt("derp.server.region_id")
 	serverRegionCode := viper.GetString("derp.server.region_code")
 	serverRegionName := viper.GetString("derp.server.region_name")
+	serverVerifyClients := viper.GetBool("derp.server.verify_clients")
 	stunAddr := viper.GetString("derp.server.stun_listen_addr")
 	privateKeyPath := util.AbsolutePathFromConfigPath(
 		viper.GetString("derp.server.private_key_path"),
@@ -479,6 +568,7 @@ func derpConfig() DERPConfig {
 		urlAddr, err := url.Parse(urlStr)
 		if err != nil {
 			log.Error().
+				Caller().
 				Str("url", urlStr).
 				Err(err).
 				Msg("Failed to parse url, ignoring...")
@@ -502,6 +592,7 @@ func derpConfig() DERPConfig {
 		ServerRegionID:                     serverRegionID,
 		ServerRegionCode:                   serverRegionCode,
 		ServerRegionName:                   serverRegionName,
+		ServerVerifyClients:                serverVerifyClients,
 		ServerPrivateKeyPath:               privateKeyPath,
 		STUNAddr:                           stunAddr,
 		URLs:                               urls,
@@ -550,6 +641,7 @@ func logConfig() LogConfig {
 		logFormat = TextLogFormat
 	default:
 		log.Error().
+			Caller().
 			Str("func", "GetLogConfig").
 			Msgf("Could not parse log format: %s. Valid choices are 'json' or 'text'", logFormatOpt)
 	}
@@ -836,7 +928,7 @@ func LoadServerConfig() (*Config, error) {
 	}
 
 	if prefix4 == nil && prefix6 == nil {
-		return nil, fmt.Errorf("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+		return nil, errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	}
 
 	allocStr := viper.GetString("prefixes.allocation")
@@ -932,14 +1024,15 @@ func LoadServerConfig() (*Config, error) {
 			OnlyStartIfOIDCIsAvailable: viper.GetBool(
 				"oidc.only_start_if_oidc_is_available",
 			),
-			Issuer:         viper.GetString("oidc.issuer"),
-			ClientID:       viper.GetString("oidc.client_id"),
-			ClientSecret:   oidcClientSecret,
-			Scope:          viper.GetStringSlice("oidc.scope"),
-			ExtraParams:    viper.GetStringMapString("oidc.extra_params"),
-			AllowedDomains: viper.GetStringSlice("oidc.allowed_domains"),
-			AllowedUsers:   viper.GetStringSlice("oidc.allowed_users"),
-			AllowedGroups:  viper.GetStringSlice("oidc.allowed_groups"),
+			Issuer:                viper.GetString("oidc.issuer"),
+			ClientID:              viper.GetString("oidc.client_id"),
+			ClientSecret:          oidcClientSecret,
+			Scope:                 viper.GetStringSlice("oidc.scope"),
+			ExtraParams:           viper.GetStringMapString("oidc.extra_params"),
+			AllowedDomains:        viper.GetStringSlice("oidc.allowed_domains"),
+			AllowedUsers:          viper.GetStringSlice("oidc.allowed_users"),
+			AllowedGroups:         viper.GetStringSlice("oidc.allowed_groups"),
+			EmailVerifiedRequired: viper.GetBool("oidc.email_verified_required"),
 			Expiry: func() time.Duration {
 				// if set to 0, we assume no expiry
 				if value := viper.GetString("oidc.expiry"); value == "0" {
@@ -964,6 +1057,9 @@ func LoadServerConfig() (*Config, error) {
 
 		LogTail:             logTailConfig,
 		RandomizeClientPort: randomizeClientPort,
+		Taildrop: TaildropConfig{
+			Enabled: viper.GetBool("taildrop.enabled"),
+		},
 
 		Policy: policyConfig(),
 
@@ -976,13 +1072,22 @@ func LoadServerConfig() (*Config, error) {
 
 		Log: logConfig,
 
-		// TODO(kradalby): Document these settings when more stable
 		Tuning: Tuning{
 			NotifierSendTimeout: viper.GetDuration("tuning.notifier_send_timeout"),
 			BatchChangeDelay:    viper.GetDuration("tuning.batch_change_delay"),
 			NodeMapSessionBufferedChanSize: viper.GetInt(
 				"tuning.node_mapsession_buffered_chan_size",
 			),
+			BatcherWorkers: func() int {
+				if workers := viper.GetInt("tuning.batcher_workers"); workers > 0 {
+					return workers
+				}
+				return DefaultBatcherWorkers()
+			}(),
+			RegisterCacheCleanup:    viper.GetDuration("tuning.register_cache_cleanup"),
+			RegisterCacheExpiration: viper.GetDuration("tuning.register_cache_expiration"),
+			NodeStoreBatchSize:      viper.GetInt("tuning.node_store_batch_size"),
+			NodeStoreBatchTimeout:   viper.GetDuration("tuning.node_store_batch_timeout"),
 		},
 	}, nil
 }
@@ -1013,7 +1118,7 @@ func isSafeServerURL(serverURL, baseDomain string) error {
 
 	s := len(serverDomainParts)
 	b := len(baseDomainParts)
-	for i := range len(baseDomainParts) {
+	for i := range baseDomainParts {
 		if serverDomainParts[s-i-1] != baseDomainParts[b-i-1] {
 			return nil
 		}

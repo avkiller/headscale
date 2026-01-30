@@ -10,7 +10,7 @@ import (
 	"github.com/ory/dockertest/v3"
 )
 
-const dockerExecuteTimeout = time.Second * 30
+const dockerExecuteTimeout = time.Second * 10
 
 var (
 	ErrDockertestCommandFailed  = errors.New("dockertest command failed")
@@ -30,7 +30,7 @@ func ExecuteCommandTimeout(timeout time.Duration) ExecuteCommandOption {
 	})
 }
 
-// buffer is a goroutine safe bytes.buffer
+// buffer is a goroutine safe bytes.buffer.
 type buffer struct {
 	store bytes.Buffer
 	mutex sync.Mutex
@@ -58,8 +58,8 @@ func ExecuteCommand(
 	env []string,
 	options ...ExecuteCommandOption,
 ) (string, string, error) {
-	var stdout = buffer{}
-	var stderr = buffer{}
+	stdout := buffer{}
+	stderr := buffer{}
 
 	execConfig := ExecuteCommandConfig{
 		timeout: dockerExecuteTimeout,

@@ -10,7 +10,7 @@ import (
 )
 
 // Got from https://github.com/xdg-go/strum/blob/main/types.go
-var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
 func isTextUnmarshaler(rv reflect.Value) bool {
 	return rv.Type().Implements(textUnmarshalerType)
@@ -31,7 +31,7 @@ func decodingError(name string, err error) error {
 // have a type that implements encoding.TextUnmarshaler.
 type TextSerialiser struct{}
 
-func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect.Value, dbValue interface{}) (err error) {
+func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect.Value, dbValue any) error {
 	fieldValue := reflect.New(field.FieldType)
 
 	// If the field is a pointer, we need to dereference it to get the actual type
@@ -70,16 +70,17 @@ func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect
 			} else {
 				dstField.Set(fieldValue.Elem())
 			}
+
 			return nil
 		} else {
 			return fmt.Errorf("unsupported type: %T", fieldValue.Interface())
 		}
 	}
 
-	return
+	return nil
 }
 
-func (TextSerialiser) Value(ctx context.Context, field *schema.Field, dst reflect.Value, fieldValue interface{}) (interface{}, error) {
+func (TextSerialiser) Value(ctx context.Context, field *schema.Field, dst reflect.Value, fieldValue any) (any, error) {
 	switch v := fieldValue.(type) {
 	case encoding.TextMarshaler:
 		// If the value is nil, we return nil, however, go nil values are not
@@ -92,6 +93,7 @@ func (TextSerialiser) Value(ctx context.Context, field *schema.Field, dst reflec
 		if err != nil {
 			return nil, err
 		}
+
 		return string(b), nil
 	default:
 		return nil, fmt.Errorf("only encoding.TextMarshaler is supported, got %t", v)

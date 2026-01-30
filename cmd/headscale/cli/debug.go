@@ -10,10 +10,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const (
-	errPreAuthKeyMalformed = Error("key is malformed. expected 64 hex characters with `nodekey` prefix")
-)
-
 // Error is used to compare errors as per https://dave.cheney.net/2016/04/07/constant-errors
 type Error string
 
@@ -117,7 +113,7 @@ var createNodeCmd = &cobra.Command{
 		if err != nil {
 			ErrorOutput(
 				err,
-				fmt.Sprintf("Cannot create node: %s", status.Convert(err).Message()),
+				"Cannot create node: "+status.Convert(err).Message(),
 				output,
 			)
 		}

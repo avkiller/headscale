@@ -4,8 +4,13 @@ import (
 	"net/netip"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
-	policyv1 "github.com/juanfont/headscale/hscontrol/policy/v1"
+	"github.com/juanfont/headscale/hscontrol"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/routes"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/ory/dockertest/v3"
+	"tailscale.com/tailcfg"
 )
 
 type ControlServer interface {
@@ -18,12 +23,27 @@ type ControlServer interface {
 	GetHealthEndpoint() string
 	GetEndpoint() string
 	WaitForRunning() error
-	CreateUser(user string) error
-	CreateAuthKey(user string, reusable bool, ephemeral bool) (*v1.PreAuthKey, error)
+	CreateUser(user string) (*v1.User, error)
+	CreateAuthKey(user uint64, reusable bool, ephemeral bool) (*v1.PreAuthKey, error)
+	CreateAuthKeyWithTags(user uint64, reusable bool, ephemeral bool, tags []string) (*v1.PreAuthKey, error)
+	CreateAuthKeyWithOptions(opts hsic.AuthKeyOptions) (*v1.PreAuthKey, error)
+	DeleteAuthKey(id uint64) error
 	ListNodes(users ...string) ([]*v1.Node, error)
+	DeleteNode(nodeID uint64) error
+	NodesByUser() (map[string][]*v1.Node, error)
+	NodesByName() (map[string]*v1.Node, error)
 	ListUsers() ([]*v1.User, error)
+	MapUsers() (map[string]*v1.User, error)
+	DeleteUser(userID uint64) error
 	ApproveRoutes(uint64, []netip.Prefix) (*v1.Node, error)
+	SetNodeTags(nodeID uint64, tags []string) error
 	GetCert() []byte
 	GetHostname() string
-	SetPolicy(*policyv1.ACLPolicy) error
+	GetIPInNetwork(network *dockertest.Network) string
+	SetPolicy(*policyv2.Policy) error
+	GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error)
+	PrimaryRoutes() (*routes.DebugRoutes, error)
+	DebugBatcher() (*hscontrol.DebugBatcherInfo, error)
+	DebugNodeStore() (map[types.NodeID]types.Node, error)
+	DebugFilter() ([]tailcfg.FilterRule, error)
 }

@@ -1,4 +1,4 @@
-![headscale logo](./docs/logo/headscale3_header_stacked_left.png)
+![headscale logo](./docs/assets/logo/headscale3_header_stacked_left.png)
 
 ![ci](https://github.com/juanfont/headscale/actions/workflows/test.yml/badge.svg)
 
@@ -7,8 +7,12 @@ An open source, self-hosted implementation of the Tailscale control server.
 Join our [Discord server](https://discord.gg/c84AZQhmpx) for a chat.
 
 **Note:** Always select the same GitHub tag as the released version you use
-to ensure you have the correct example configuration and documentation.
-The `main` branch might contain unreleased changes.
+to ensure you have the correct example configuration. The `main` branch might
+contain unreleased changes. The documentation is available for stable and
+development versions:
+
+- [Documentation for the stable version](https://headscale.net/stable/)
+- [Documentation for the development version](https://headscale.net/development/)
 
 ## What is Tailscale
 
@@ -58,6 +62,8 @@ Please see ["Client and operating system support" in the documentation](https://
 and container to run Headscale.**
 
 Please have a look at the [`documentation`](https://headscale.net/stable/).
+
+For NixOS users, a module is available in [`nix/`](./nix/).
 
 ## Talks
 
@@ -135,14 +141,29 @@ make test
 To build the program:
 
 ```shell
-nix build
-```
-
-or
-
-```shell
 make build
 ```
+
+### Development workflow
+
+We recommend using Nix for dependency management to ensure you have all required tools. If you prefer to manage dependencies yourself, you can use Make directly:
+
+**With Nix (recommended):**
+
+```shell
+nix develop
+make test
+make build
+```
+
+**With your own dependencies:**
+
+```shell
+make test
+make build
+```
+
+The Makefile will warn you if any required tools are missing and suggest running `nix develop`. Run `make help` to see all available targets.
 
 ## Contributors
 

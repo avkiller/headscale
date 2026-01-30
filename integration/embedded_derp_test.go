@@ -1,12 +1,15 @@
 package integration
 
 import (
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 type ClientsSpec struct {
@@ -27,7 +30,7 @@ func TestDERPServerScenario(t *testing.T) {
 
 	derpServerScenario(t, spec, false, func(scenario *Scenario) {
 		allClients, err := scenario.ListTailscaleClients()
-		assertNoErrListClients(t, err)
+		requireNoErrListClients(t, err)
 		t.Logf("checking %d clients for websocket connections", len(allClients))
 
 		for _, client := range allClients {
@@ -39,6 +42,28 @@ func TestDERPServerScenario(t *testing.T) {
 				t.Fail()
 			}
 		}
+
+		hsServer, err := scenario.Headscale()
+		requireNoErrGetHeadscale(t, err)
+
+		derpRegion := tailcfg.DERPRegion{
+			RegionCode: "test-derpverify",
+			RegionName: "TestDerpVerify",
+			Nodes: []*tailcfg.DERPNode{
+				{
+					Name:             "TestDerpVerify",
+					RegionID:         900,
+					HostName:         hsServer.GetHostname(),
+					STUNPort:         3478,
+					STUNOnly:         false,
+					DERPPort:         443,
+					InsecureForTests: true,
+				},
+			},
+		}
+
+		fakeKey := key.NewNode()
+		DERPVerify(t, fakeKey, derpRegion, false)
 	})
 }
 
@@ -47,15 +72,15 @@ func TestDERPServerWebsocketScenario(t *testing.T) {
 		NodesPerUser: 1,
 		Users:        []string{"user1", "user2", "user3"},
 		Networks: map[string][]string{
-			"usernet1": []string{"user1"},
-			"usernet2": []string{"user2"},
-			"usernet3": []string{"user3"},
+			"usernet1": {"user1"},
+			"usernet2": {"user2"},
+			"usernet3": {"user3"},
 		},
 	}
 
 	derpServerScenario(t, spec, true, func(scenario *Scenario) {
 		allClients, err := scenario.ListTailscaleClients()
-		assertNoErrListClients(t, err)
+		requireNoErrListClients(t, err)
 		t.Logf("checking %d clients for websocket connections", len(allClients))
 
 		for _, client := range allClients {
@@ -82,10 +107,9 @@ func derpServerScenario(
 	furtherAssertions ...func(*Scenario),
 ) {
 	IntegrationSkip(t)
-	// t.Parallel()
 
 	scenario, err := NewScenario(spec)
-	assertNoErr(t, err)
+	require.NoError(t, err)
 
 	defer scenario.ShutdownAssertNoPanics(t)
 
@@ -99,34 +123,35 @@ func derpServerScenario(
 		hsic.WithPort(443),
 		hsic.WithTLS(),
 		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_DERP_AUTO_UPDATE_ENABLED": "true",
-			"HEADSCALE_DERP_UPDATE_FREQUENCY":    "10s",
-			"HEADSCALE_LISTEN_ADDR":              "0.0.0.0:443",
+			"HEADSCALE_DERP_AUTO_UPDATE_ENABLED":   "true",
+			"HEADSCALE_DERP_UPDATE_FREQUENCY":      "10s",
+			"HEADSCALE_LISTEN_ADDR":                "0.0.0.0:443",
+			"HEADSCALE_DERP_SERVER_VERIFY_CLIENTS": "true",
 		}),
 	)
-	assertNoErrHeadscaleEnv(t, err)
+	requireNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
+	requireNoErrListClients(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	assertNoErrSync(t, err)
+	requireNoErrSync(t, err)
 
 	allHostnames, err := scenario.ListTailscaleClientsFQDNs()
-	assertNoErrListFQDN(t, err)
+	requireNoErrListFQDN(t, err)
 
 	for _, client := range allClients {
-		status, err := client.Status()
-		assertNoErr(t, err)
+		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+			status, err := client.Status()
+			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
 
-		for _, health := range status.Health {
-			if strings.Contains(health, "could not connect to any relay server") {
-				t.Errorf("expected to be connected to derp, found: %s", health)
+			for _, health := range status.Health {
+				assert.NotContains(ct, health, "could not connect to any relay server",
+					"Client %s should be connected to DERP relay", client.Hostname())
+				assert.NotContains(ct, health, "could not connect to the 'Headscale Embedded DERP' relay server.",
+					"Client %s should be connected to Headscale Embedded DERP", client.Hostname())
 			}
-			if strings.Contains(health, "could not connect to the 'Headscale Embedded DERP' relay server.") {
-				t.Errorf("expected to be connected to derp, found: %s", health)
-			}
-		}
+		}, 30*time.Second, 2*time.Second)
 	}
 
 	success := pingDerpAllHelper(t, allClients, allHostnames)
@@ -137,23 +162,24 @@ func derpServerScenario(
 	}
 
 	for _, client := range allClients {
-		status, err := client.Status()
-		assertNoErr(t, err)
+		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+			status, err := client.Status()
+			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
 
-		for _, health := range status.Health {
-			if strings.Contains(health, "could not connect to any relay server") {
-				t.Errorf("expected to be connected to derp, found: %s", health)
+			for _, health := range status.Health {
+				assert.NotContains(ct, health, "could not connect to any relay server",
+					"Client %s should be connected to DERP relay after first run", client.Hostname())
+				assert.NotContains(ct, health, "could not connect to the 'Headscale Embedded DERP' relay server.",
+					"Client %s should be connected to Headscale Embedded DERP after first run", client.Hostname())
 			}
-			if strings.Contains(health, "could not connect to the 'Headscale Embedded DERP' relay server.") {
-				t.Errorf("expected to be connected to derp, found: %s", health)
-			}
-		}
+		}, 30*time.Second, 2*time.Second)
 	}
 
 	t.Logf("Run 1: %d successful pings out of %d", success, len(allClients)*len(allHostnames))
 
 	// Let the DERP updater run a couple of times to ensure it does not
-	// break the DERPMap.
+	// break the DERPMap. The updater runs on a 10s interval by default.
+	//nolint:forbidigo // Intentional delay: must wait for DERP updater to run multiple times (interval-based)
 	time.Sleep(30 * time.Second)
 
 	success = pingDerpAllHelper(t, allClients, allHostnames)
@@ -162,17 +188,17 @@ func derpServerScenario(
 	}
 
 	for _, client := range allClients {
-		status, err := client.Status()
-		assertNoErr(t, err)
+		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+			status, err := client.Status()
+			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
 
-		for _, health := range status.Health {
-			if strings.Contains(health, "could not connect to any relay server") {
-				t.Errorf("expected to be connected to derp, found: %s", health)
+			for _, health := range status.Health {
+				assert.NotContains(ct, health, "could not connect to any relay server",
+					"Client %s should be connected to DERP relay after second run", client.Hostname())
+				assert.NotContains(ct, health, "could not connect to the 'Headscale Embedded DERP' relay server.",
+					"Client %s should be connected to Headscale Embedded DERP after second run", client.Hostname())
 			}
-			if strings.Contains(health, "could not connect to the 'Headscale Embedded DERP' relay server.") {
-				t.Errorf("expected to be connected to derp, found: %s", health)
-			}
-		}
+		}, 30*time.Second, 2*time.Second)
 	}
 
 	t.Logf("Run2: %d successful pings out of %d", success, len(allClients)*len(allHostnames))

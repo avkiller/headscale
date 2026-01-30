@@ -3,6 +3,8 @@ package db
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -24,8 +26,7 @@ func (hsdb *HSDatabase) CreateUser(user types.User) (*types.User, error) {
 // CreateUser creates a new User. Returns error if could not be created
 // or another user already exists.
 func CreateUser(tx *gorm.DB, user types.User) (*types.User, error) {
-	err := util.ValidateUsername(user.Name)
-	if err != nil {
+	if err := util.ValidateHostname(user.Name); err != nil {
 		return nil, err
 	}
 	if err := tx.Create(&user).Error; err != nil {
@@ -57,12 +58,12 @@ func DestroyUser(tx *gorm.DB, uid types.UserID) error {
 		return ErrUserStillHasNodes
 	}
 
-	keys, err := ListPreAuthKeysByUser(tx, uid)
+	keys, err := ListPreAuthKeys(tx)
 	if err != nil {
 		return err
 	}
 	for _, key := range keys {
-		err = DestroyPreAuthKey(tx, key)
+		err = DestroyPreAuthKey(tx, key.ID)
 		if err != nil {
 			return err
 		}
@@ -91,8 +92,7 @@ func RenameUser(tx *gorm.DB, uid types.UserID, newName string) error {
 	if err != nil {
 		return err
 	}
-	err = util.ValidateUsername(newName)
-	if err != nil {
+	if err = util.ValidateHostname(newName); err != nil {
 		return err
 	}
 
@@ -102,7 +102,8 @@ func RenameUser(tx *gorm.DB, uid types.UserID, newName string) error {
 
 	oldUser.Name = newName
 
-	if err := tx.Save(&oldUser).Error; err != nil {
+	err = tx.Updates(&oldUser).Error
+	if err != nil {
 		return err
 	}
 
@@ -110,9 +111,7 @@ func RenameUser(tx *gorm.DB, uid types.UserID, newName string) error {
 }
 
 func (hsdb *HSDatabase) GetUserByID(uid types.UserID) (*types.User, error) {
-	return Read(hsdb.DB, func(rx *gorm.DB) (*types.User, error) {
-		return GetUserByID(rx, uid)
-	})
+	return GetUserByID(hsdb.DB, uid)
 }
 
 func GetUserByID(tx *gorm.DB, uid types.UserID) (*types.User, error) {
@@ -146,9 +145,7 @@ func GetUserByOIDCIdentifier(tx *gorm.DB, id string) (*types.User, error) {
 }
 
 func (hsdb *HSDatabase) ListUsers(where ...*types.User) ([]types.User, error) {
-	return Read(hsdb.DB, func(rx *gorm.DB) ([]types.User, error) {
-		return ListUsers(rx, where...)
-	})
+	return ListUsers(hsdb.DB, where...)
 }
 
 // ListUsers gets all the existing users.
@@ -192,29 +189,50 @@ func (hsdb *HSDatabase) GetUserByName(name string) (*types.User, error) {
 // ListNodesByUser gets all the nodes in a given user.
 func ListNodesByUser(tx *gorm.DB, uid types.UserID) (types.Nodes, error) {
 	nodes := types.Nodes{}
-	if err := tx.Preload("AuthKey").Preload("AuthKey.User").Preload("User").Where(&types.Node{UserID: uint(uid)}).Find(&nodes).Error; err != nil {
+
+	uidPtr := uint(uid)
+
+	err := tx.Preload("AuthKey").Preload("AuthKey.User").Preload("User").Where(&types.Node{UserID: &uidPtr}).Find(&nodes).Error
+	if err != nil {
 		return nil, err
 	}
 
 	return nodes, nil
 }
 
-func (hsdb *HSDatabase) AssignNodeToUser(node *types.Node, uid types.UserID) error {
-	return hsdb.Write(func(tx *gorm.DB) error {
-		return AssignNodeToUser(tx, node, uid)
-	})
+func (hsdb *HSDatabase) CreateUserForTest(name ...string) *types.User {
+	if !testing.Testing() {
+		panic("CreateUserForTest can only be called during tests")
+	}
+
+	userName := "testuser"
+	if len(name) > 0 && name[0] != "" {
+		userName = name[0]
+	}
+
+	user, err := hsdb.CreateUser(types.User{Name: userName})
+	if err != nil {
+		panic(fmt.Sprintf("failed to create test user: %v", err))
+	}
+
+	return user
 }
 
-// AssignNodeToUser assigns a Node to a user.
-func AssignNodeToUser(tx *gorm.DB, node *types.Node, uid types.UserID) error {
-	user, err := GetUserByID(tx, uid)
-	if err != nil {
-		return err
-	}
-	node.User = *user
-	if result := tx.Save(&node); result.Error != nil {
-		return result.Error
+func (hsdb *HSDatabase) CreateUsersForTest(count int, namePrefix ...string) []*types.User {
+	if !testing.Testing() {
+		panic("CreateUsersForTest can only be called during tests")
 	}
 
-	return nil
+	prefix := "testuser"
+	if len(namePrefix) > 0 && namePrefix[0] != "" {
+		prefix = namePrefix[0]
+	}
+
+	users := make([]*types.User, count)
+	for i := range count {
+		name := prefix + "-" + strconv.Itoa(i)
+		users[i] = hsdb.CreateUserForTest(name)
+	}
+
+	return users
 }

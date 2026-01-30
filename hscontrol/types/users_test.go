@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestUnmarshallOIDCClaims(t *testing.T) {
@@ -76,14 +77,228 @@ func TestUnmarshallOIDCClaims(t *testing.T) {
 	}
 }
 
-func TestOIDCClaimsJSONToUser(t *testing.T) {
+func TestOIDCClaimsIdentifier(t *testing.T) {
 	tests := []struct {
-		name    string
-		jsonstr string
-		want    User
+		name     string
+		iss      string
+		sub      string
+		expected string
 	}{
 		{
-			name: "normal-bool",
+			name:     "standard URL with trailing slash",
+			iss:      "https://oidc.example.com/",
+			sub:      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+			expected: "https://oidc.example.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+		},
+		{
+			name:     "standard URL without trailing slash",
+			iss:      "https://oidc.example.com",
+			sub:      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+			expected: "https://oidc.example.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+		},
+		{
+			name:     "standard URL with uppercase protocol",
+			iss:      "HTTPS://oidc.example.com/",
+			sub:      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+			expected: "https://oidc.example.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+		},
+		{
+			name:     "standard URL with path and trailing slash",
+			iss:      "https://login.microsoftonline.com/v2.0/",
+			sub:      "I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+			expected: "https://login.microsoftonline.com/v2.0/I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+		},
+		{
+			name:     "standard URL with path without trailing slash",
+			iss:      "https://login.microsoftonline.com/v2.0",
+			sub:      "I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+			expected: "https://login.microsoftonline.com/v2.0/I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+		},
+		{
+			name:     "non-URL identifier with slash",
+			iss:      "oidc",
+			sub:      "sub",
+			expected: "oidc/sub",
+		},
+		{
+			name:     "non-URL identifier with trailing slash",
+			iss:      "oidc/",
+			sub:      "sub",
+			expected: "oidc/sub",
+		},
+		{
+			name:     "subject with slash",
+			iss:      "oidc/",
+			sub:      "sub/",
+			expected: "oidc/sub",
+		},
+		{
+			name:     "whitespace",
+			iss:      "   oidc/   ",
+			sub:      "   sub   ",
+			expected: "oidc/sub",
+		},
+		{
+			name:     "newline",
+			iss:      "\noidc/\n",
+			sub:      "\nsub\n",
+			expected: "oidc/sub",
+		},
+		{
+			name:     "tab",
+			iss:      "\toidc/\t",
+			sub:      "\tsub\t",
+			expected: "oidc/sub",
+		},
+		{
+			name:     "empty issuer",
+			iss:      "",
+			sub:      "sub",
+			expected: "sub",
+		},
+		{
+			name:     "empty subject",
+			iss:      "https://oidc.example.com",
+			sub:      "",
+			expected: "https://oidc.example.com",
+		},
+		{
+			name:     "both empty",
+			iss:      "",
+			sub:      "",
+			expected: "",
+		},
+		{
+			name:     "URL with double slash",
+			iss:      "https://login.microsoftonline.com//v2.0",
+			sub:      "I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+			expected: "https://login.microsoftonline.com/v2.0/I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+		},
+		{
+			name:     "FTP URL protocol",
+			iss:      "ftp://example.com/directory",
+			sub:      "resource",
+			expected: "ftp://example.com/directory/resource",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := OIDCClaims{
+				Iss: tt.iss,
+				Sub: tt.sub,
+			}
+			result := claims.Identifier()
+			assert.Equal(t, tt.expected, result)
+			if diff := cmp.Diff(tt.expected, result); diff != "" {
+				t.Errorf("Identifier() mismatch (-want +got):\n%s", diff)
+			}
+
+			// Now clean the identifier and verify it's still the same
+			cleaned := CleanIdentifier(result)
+
+			// Double-check with cmp.Diff for better error messages
+			if diff := cmp.Diff(tt.expected, cleaned); diff != "" {
+				t.Errorf("CleanIdentifier(Identifier()) mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCleanIdentifier(t *testing.T) {
+	tests := []struct {
+		name       string
+		identifier string
+		expected   string
+	}{
+		{
+			name:       "empty identifier",
+			identifier: "",
+			expected:   "",
+		},
+		{
+			name:       "simple identifier",
+			identifier: "oidc/sub",
+			expected:   "oidc/sub",
+		},
+		{
+			name:       "double slashes in the middle",
+			identifier: "oidc//sub",
+			expected:   "oidc/sub",
+		},
+		{
+			name:       "trailing slash",
+			identifier: "oidc/sub/",
+			expected:   "oidc/sub",
+		},
+		{
+			name:       "multiple double slashes",
+			identifier: "oidc//sub///id//",
+			expected:   "oidc/sub/id",
+		},
+		{
+			name:       "HTTP URL with proper scheme",
+			identifier: "http://example.com/path",
+			expected:   "http://example.com/path",
+		},
+		{
+			name:       "HTTP URL with double slashes in path",
+			identifier: "http://example.com//path///resource",
+			expected:   "http://example.com/path/resource",
+		},
+		{
+			name:       "HTTPS URL with empty segments",
+			identifier: "https://example.com///path//",
+			expected:   "https://example.com/path",
+		},
+		{
+			name:       "URL with double slashes in domain",
+			identifier: "https://login.microsoftonline.com//v2.0/I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+			expected:   "https://login.microsoftonline.com/v2.0/I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
+		},
+		{
+			name:       "FTP URL with double slashes",
+			identifier: "ftp://example.com//resource//",
+			expected:   "ftp://example.com/resource",
+		},
+		{
+			name:       "Just slashes",
+			identifier: "///",
+			expected:   "",
+		},
+		{
+			name:       "Leading slash without URL",
+			identifier: "/path//to///resource",
+			expected:   "path/to/resource",
+		},
+		{
+			name:       "Non-standard protocol",
+			identifier: "ldap://example.org//path//to//resource",
+			expected:   "ldap://example.org/path/to/resource",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := CleanIdentifier(tt.identifier)
+			assert.Equal(t, tt.expected, result)
+			if diff := cmp.Diff(tt.expected, result); diff != "" {
+				t.Errorf("CleanIdentifier() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestOIDCClaimsJSONToUser(t *testing.T) {
+	tests := []struct {
+		name                  string
+		jsonstr               string
+		emailVerifiedRequired bool
+		want                  User
+	}{
+		{
+			name:                  "normal-bool",
+			emailVerifiedRequired: true,
 			jsonstr: `
 {
   "sub": "test",
@@ -101,7 +316,8 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 			},
 		},
 		{
-			name: "string-bool-true",
+			name:                  "string-bool-true",
+			emailVerifiedRequired: true,
 			jsonstr: `
 {
   "sub": "test2",
@@ -119,7 +335,8 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 			},
 		},
 		{
-			name: "string-bool-false",
+			name:                  "string-bool-false",
+			emailVerifiedRequired: true,
 			jsonstr: `
 {
   "sub": "test3",
@@ -136,8 +353,28 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 			},
 		},
 		{
+			name:                  "allow-unverified-email",
+			emailVerifiedRequired: false,
+			jsonstr: `
+{
+  "sub": "test4",
+  "email": "test4@test.no",
+  "email_verified": "false"
+}
+			`,
+			want: User{
+				Provider: util.RegisterMethodOIDC,
+				Email:    "test4@test.no",
+				ProviderIdentifier: sql.NullString{
+					String: "/test4",
+					Valid:  true,
+				},
+			},
+		},
+		{
 			// From https://github.com/juanfont/headscale/issues/2333
-			name: "okta-oidc-claim-20250121",
+			name:                  "okta-oidc-claim-20250121",
+			emailVerifiedRequired: true,
 			jsonstr: `
 {
   "sub": "00u7dr4qp7XXXXXXXXXX",
@@ -162,6 +399,7 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 			want: User{
 				Provider:    util.RegisterMethodOIDC,
 				DisplayName: "Tim Horton",
+				Email:       "",
 				Name:        "tim.horton@company.com",
 				ProviderIdentifier: sql.NullString{
 					String: "https://sso.company.com/oauth2/default/00u7dr4qp7XXXXXXXXXX",
@@ -171,7 +409,8 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 		},
 		{
 			// From https://github.com/juanfont/headscale/issues/2333
-			name: "okta-oidc-claim-20250121",
+			name:                  "okta-oidc-claim-20250121",
+			emailVerifiedRequired: true,
 			jsonstr: `
 {
   "aud": "79xxxxxx-xxxx-xxxx-xxxx-892146xxxxxx",
@@ -196,6 +435,7 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 				Provider:    util.RegisterMethodOIDC,
 				DisplayName: "XXXXXX XXXX",
 				Name:        "user@domain.com",
+				Email:       "",
 				ProviderIdentifier: sql.NullString{
 					String: "https://login.microsoftonline.com/v2.0/I-70OQnj3TogrNSfkZQqB3f7dGwyBWSm1dolHNKrMzQ",
 					Valid:  true,
@@ -204,7 +444,8 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 		},
 		{
 			// From https://github.com/juanfont/headscale/issues/2333
-			name: "casby-oidc-claim-20250513",
+			name:                  "casby-oidc-claim-20250513",
+			emailVerifiedRequired: true,
 			jsonstr: `
 			{
   "sub": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
@@ -245,7 +486,7 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 
 			var user User
 
-			user.FromClaim(&got)
+			user.FromClaim(&got, tt.emailVerifiedRequired)
 			if diff := cmp.Diff(user, tt.want); diff != "" {
 				t.Errorf("TestOIDCClaimsJSONToUser() mismatch (-want +got):\n%s", diff)
 			}

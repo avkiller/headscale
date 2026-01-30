@@ -2,11 +2,10 @@ package hscontrol
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"slices"
 	"strings"
@@ -15,9 +14,9 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gorilla/mux"
 	"github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/notifier"
-	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
@@ -27,6 +26,8 @@ import (
 const (
 	randomByteSize           = 16
 	defaultOAuthOptionsCount = 3
+	registerCacheExpiration  = time.Minute * 15
+	registerCacheCleanup     = time.Minute * 20
 )
 
 var (
@@ -40,10 +41,7 @@ var (
 	errOIDCAllowedUsers  = errors.New(
 		"authenticated principal does not match any allowed user",
 	)
-	errOIDCInvalidNodeState = errors.New(
-		"requested node state key expired before authorisation completed",
-	)
-	errOIDCNodeKeyMissing = errors.New("could not get node key from cache")
+	errOIDCUnverifiedEmail = errors.New("authenticated principal has an unverified email")
 )
 
 // RegistrationInfo contains both machine key and verifier information for OIDC validation.
@@ -53,13 +51,10 @@ type RegistrationInfo struct {
 }
 
 type AuthProviderOIDC struct {
+	h                 *Headscale
 	serverURL         string
 	cfg               *types.OIDCConfig
-	db                *db.HSDatabase
 	registrationCache *zcache.Cache[string, RegistrationInfo]
-	notifier          *notifier.Notifier
-	ipAlloc           *db.IPAllocator
-	polMan            policy.PolicyManager
 
 	oidcProvider *oidc.Provider
 	oauth2Config *oauth2.Config
@@ -67,12 +62,9 @@ type AuthProviderOIDC struct {
 
 func NewAuthProviderOIDC(
 	ctx context.Context,
+	h *Headscale,
 	serverURL string,
 	cfg *types.OIDCConfig,
-	db *db.HSDatabase,
-	notif *notifier.Notifier,
-	ipAlloc *db.IPAllocator,
-	polMan policy.PolicyManager,
 ) (*AuthProviderOIDC, error) {
 	var err error
 	// grab oidc config if it hasn't been already
@@ -85,11 +77,8 @@ func NewAuthProviderOIDC(
 		ClientID:     cfg.ClientID,
 		ClientSecret: cfg.ClientSecret,
 		Endpoint:     oidcProvider.Endpoint(),
-		RedirectURL: fmt.Sprintf(
-			"%s/oidc/callback",
-			strings.TrimSuffix(serverURL, "/"),
-		),
-		Scopes: cfg.Scope,
+		RedirectURL:  strings.TrimSuffix(serverURL, "/") + "/oidc/callback",
+		Scopes:       cfg.Scope,
 	}
 
 	registrationCache := zcache.New[string, RegistrationInfo](
@@ -98,13 +87,10 @@ func NewAuthProviderOIDC(
 	)
 
 	return &AuthProviderOIDC{
+		h:                 h,
 		serverURL:         serverURL,
 		cfg:               cfg,
-		db:                db,
 		registrationCache: registrationCache,
-		notifier:          notif,
-		ipAlloc:           ipAlloc,
-		polMan:            polMan,
 
 		oidcProvider: oidcProvider,
 		oauth2Config: oauth2Config,
@@ -118,23 +104,15 @@ func (a *AuthProviderOIDC) AuthURL(registrationID types.RegistrationID) string {
 		registrationID.String())
 }
 
-func (a *AuthProviderOIDC) determineNodeExpiry(idTokenExpiration time.Time) time.Time {
-	if a.cfg.UseExpiryFromToken {
-		return idTokenExpiration
-	}
-
-	return time.Now().Add(a.cfg.Expiry)
-}
-
-// RegisterOIDC redirects to the OIDC provider for authentication
-// Puts NodeKey in cache so the callback can retrieve it using the oidc state param
+// RegisterHandler registers the OIDC callback handler with the given router.
+// It puts NodeKey in cache so the callback can retrieve it using the oidc state param.
 // Listens in /register/:registration_id.
 func (a *AuthProviderOIDC) RegisterHandler(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
 	vars := mux.Vars(req)
-	registrationIdStr, _ := vars["registration_id"]
+	registrationIdStr := vars["registration_id"]
 
 	// We need to make sure we dont open for XSS style injections, if the parameter that
 	// is passed as a key is not parsable/validated as a NodePublic key, then fail to render
@@ -191,22 +169,10 @@ func (a *AuthProviderOIDC) RegisterHandler(
 	a.registrationCache.Set(state, registrationInfo)
 
 	authURL := a.oauth2Config.AuthCodeURL(state, extras...)
-	log.Debug().Msgf("Redirecting to %s for authentication", authURL)
+	log.Debug().Caller().Msgf("Redirecting to %s for authentication", authURL)
 
 	http.Redirect(writer, req, authURL, http.StatusFound)
 }
-
-type oidcCallbackTemplateConfig struct {
-	User string
-	Verb string
-}
-
-//go:embed assets/oidc_callback_template.html
-var oidcCallbackTemplateContent string
-
-var oidcCallbackTemplate = template.Must(
-	template.New("oidccallback").Parse(oidcCallbackTemplateContent),
-)
 
 // OIDCCallbackHandler handles the callback from the OIDC endpoint
 // Retrieves the nkey from the state cache and adds the node to the users email user
@@ -223,7 +189,8 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	cookieState, err := req.Cookie("state")
+	stateCookieName := getCookieName("state", state)
+	cookieState, err := req.Cookie(stateCookieName)
 	if err != nil {
 		httpError(writer, NewHTTPError(http.StatusBadRequest, "state not found", err))
 		return
@@ -235,7 +202,6 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	}
 
 	oauth2Token, err := a.getOauth2Token(req.Context(), code, state)
-
 	if err != nil {
 		httpError(writer, err)
 		return
@@ -246,8 +212,13 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		httpError(writer, err)
 		return
 	}
+	if idToken.Nonce == "" {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "nonce not found in IDToken", err))
+		return
+	}
 
-	nonce, err := req.Cookie("nonce")
+	nonceCookieName := getCookieName("nonce", idToken.Nonce)
+	nonce, err := req.Cookie(nonceCookieName)
 	if err != nil {
 		httpError(writer, NewHTTPError(http.StatusBadRequest, "nonce not found", err))
 		return
@@ -265,34 +236,57 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	if err := validateOIDCAllowedDomains(a.cfg.AllowedDomains, &claims); err != nil {
-		httpError(writer, err)
-		return
+	// Fetch user information (email, groups, name, etc) from the userinfo endpoint
+	// https://openid.net/specs/openid-connect-core-1_0.html#UserInfo
+	var userinfo *oidc.UserInfo
+	userinfo, err = a.oidcProvider.UserInfo(req.Context(), oauth2.StaticTokenSource(oauth2Token))
+	if err != nil {
+		util.LogErr(err, "could not get userinfo; only using claims from id token")
 	}
 
-	if err := validateOIDCAllowedGroups(a.cfg.AllowedGroups, &claims); err != nil {
-		httpError(writer, err)
-		return
-	}
-
-	if err := validateOIDCAllowedUsers(a.cfg.AllowedUsers, &claims); err != nil {
-		httpError(writer, err)
-		return
-	}
-
-	// If EmailVerified is missing, we can try to get it from UserInfo
-	if !claims.EmailVerified {
-		var userinfo *oidc.UserInfo
-		userinfo, err = a.oidcProvider.UserInfo(req.Context(), oauth2.StaticTokenSource(oauth2Token))
-		if err != nil {
-			util.LogErr(err, "could not get userinfo; email cannot be verified")
+	// The oidc.UserInfo type only decodes some fields (Subject, Profile, Email, EmailVerified).
+	// We are interested in other fields too (e.g. groups are required for allowedGroups) so we
+	// decode into our own OIDCUserInfo type using the underlying claims struct.
+	var userinfo2 types.OIDCUserInfo
+	if userinfo != nil && userinfo.Claims(&userinfo2) == nil && userinfo2.Sub == claims.Sub {
+		// Update the user with the userinfo claims (with id token claims as fallback).
+		// TODO(kradalby): there might be more interesting fields here that we have not found yet.
+		claims.Email = cmp.Or(userinfo2.Email, claims.Email)
+		claims.EmailVerified = cmp.Or(userinfo2.EmailVerified, claims.EmailVerified)
+		claims.Username = cmp.Or(userinfo2.PreferredUsername, claims.Username)
+		claims.Name = cmp.Or(userinfo2.Name, claims.Name)
+		claims.ProfilePictureURL = cmp.Or(userinfo2.Picture, claims.ProfilePictureURL)
+		if userinfo2.Groups != nil {
+			claims.Groups = userinfo2.Groups
 		}
-		claims.EmailVerified = types.FlexibleBoolean(userinfo.EmailVerified)
+	} else {
+		util.LogErr(err, "could not get userinfo; only using claims from id token")
 	}
 
-	user, err := a.createOrUpdateUserFromClaim(&claims)
+	// The user claims are now updated from the userinfo endpoint so we can verify the user
+	// against allowed emails, email domains, and groups.
+	err = doOIDCAuthorization(a.cfg, &claims)
 	if err != nil {
 		httpError(writer, err)
+		return
+	}
+
+	user, _, err := a.createOrUpdateUserFromClaim(&claims)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Caller().
+			Msgf("could not create or update user")
+		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		writer.WriteHeader(http.StatusInternalServerError)
+		_, werr := writer.Write([]byte("Could not create or update user"))
+		if werr != nil {
+			log.Error().
+				Caller().
+				Err(werr).
+				Msg("Failed to write HTTP response")
+		}
+
 		return
 	}
 
@@ -307,6 +301,12 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		verb := "Reauthenticated"
 		newNode, err := a.handleRegistration(user, *registrationId, nodeExpiry)
 		if err != nil {
+			if errors.Is(err, db.ErrNodeNotFoundRegistrationCache) {
+				log.Debug().Caller().Str("registration_id", registrationId.String()).Msg("registration session expired before authorization completed")
+				httpError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", err))
+
+				return
+			}
 			httpError(writer, err)
 			return
 		}
@@ -325,7 +325,7 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		writer.WriteHeader(http.StatusOK)
 		if _, err := writer.Write(content.Bytes()); err != nil {
-			util.LogErr(err, "Failed to write response")
+			util.LogErr(err, "Failed to write HTTP response")
 		}
 
 		return
@@ -334,7 +334,14 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	// Neither node nor machine key was found in the state cache meaning
 	// that we could not reauth nor register the node.
 	httpError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
-	return
+}
+
+func (a *AuthProviderOIDC) determineNodeExpiry(idTokenExpiration time.Time) time.Time {
+	if a.cfg.UseExpiryFromToken {
+		return idTokenExpiration
+	}
+
+	return time.Now().Add(a.cfg.Expiry)
 }
 
 func extractCodeAndStateParamFromRequest(
@@ -372,6 +379,7 @@ func (a *AuthProviderOIDC) getOauth2Token(
 	if err != nil {
 		return nil, NewHTTPError(http.StatusForbidden, "invalid code", fmt.Errorf("could not exchange code for token: %w", err))
 	}
+
 	return oauth2Token, err
 }
 
@@ -418,17 +426,13 @@ func validateOIDCAllowedGroups(
 	allowedGroups []string,
 	claims *types.OIDCClaims,
 ) error {
-	if len(allowedGroups) > 0 {
-		for _, group := range allowedGroups {
-			if slices.Contains(claims.Groups, group) {
-				return nil
-			}
+	for _, group := range allowedGroups {
+		if slices.Contains(claims.Groups, group) {
+			return nil
 		}
-
-		return NewHTTPError(http.StatusUnauthorized, "unauthorised group", errOIDCAllowedGroups)
 	}
 
-	return nil
+	return NewHTTPError(http.StatusUnauthorized, "unauthorised group", errOIDCAllowedGroups)
 }
 
 // validateOIDCAllowedUsers checks that if AllowedUsers is provided,
@@ -437,9 +441,57 @@ func validateOIDCAllowedUsers(
 	allowedUsers []string,
 	claims *types.OIDCClaims,
 ) error {
-	if len(allowedUsers) > 0 &&
-		!slices.Contains(allowedUsers, claims.Email) {
+	if !slices.Contains(allowedUsers, claims.Email) {
 		return NewHTTPError(http.StatusUnauthorized, "unauthorised user", errOIDCAllowedUsers)
+	}
+
+	return nil
+}
+
+// doOIDCAuthorization applies authorization tests to claims.
+//
+// The following tests are always applied:
+//
+// - validateOIDCAllowedGroups
+//
+// The following tests are applied if cfg.EmailVerifiedRequired=false
+// or claims.email_verified=true:
+//
+// - validateOIDCAllowedDomains
+// - validateOIDCAllowedUsers
+//
+// NOTE that, contrary to the function name, validateOIDCAllowedUsers
+// only checks the email address -- not the username.
+func doOIDCAuthorization(
+	cfg *types.OIDCConfig,
+	claims *types.OIDCClaims,
+) error {
+	if len(cfg.AllowedGroups) > 0 {
+		err := validateOIDCAllowedGroups(cfg.AllowedGroups, claims)
+		if err != nil {
+			return err
+		}
+	}
+
+	trustEmail := !cfg.EmailVerifiedRequired || bool(claims.EmailVerified)
+
+	hasEmailTests := len(cfg.AllowedDomains) > 0 || len(cfg.AllowedUsers) > 0
+	if !trustEmail && hasEmailTests {
+		return NewHTTPError(http.StatusUnauthorized, "unverified email", errOIDCUnverifiedEmail)
+	}
+
+	if len(cfg.AllowedDomains) > 0 {
+		err := validateOIDCAllowedDomains(cfg.AllowedDomains, claims)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(cfg.AllowedUsers) > 0 {
+		err := validateOIDCAllowedUsers(cfg.AllowedUsers, claims)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -457,31 +509,44 @@ func (a *AuthProviderOIDC) getRegistrationIDFromState(state string) *types.Regis
 
 func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 	claims *types.OIDCClaims,
-) (*types.User, error) {
-	var user *types.User
-	var err error
-	user, err = a.db.GetUserByOIDCIdentifier(claims.Identifier())
+) (*types.User, change.Change, error) {
+	var (
+		user    *types.User
+		err     error
+		newUser bool
+		c       change.Change
+	)
+	user, err = a.h.state.GetUserByOIDCIdentifier(claims.Identifier())
 	if err != nil && !errors.Is(err, db.ErrUserNotFound) {
-		return nil, fmt.Errorf("creating or updating user: %w", err)
+		return nil, change.Change{}, fmt.Errorf("creating or updating user: %w", err)
 	}
 
 	// if the user is still not found, create a new empty user.
+	// TODO(kradalby): This context is not inherited from the request, which is probably not ideal.
+	// However, we need a context to use the OIDC provider.
 	if user == nil {
+		newUser = true
 		user = &types.User{}
 	}
 
-	user.FromClaim(claims)
-	err = a.db.DB.Save(user).Error
-	if err != nil {
-		return nil, fmt.Errorf("creating or updating user: %w", err)
+	user.FromClaim(claims, a.cfg.EmailVerifiedRequired)
+
+	if newUser {
+		user, c, err = a.h.state.CreateUser(*user)
+		if err != nil {
+			return nil, change.Change{}, fmt.Errorf("creating user: %w", err)
+		}
+	} else {
+		_, c, err = a.h.state.UpdateUser(types.UserID(user.ID), func(u *types.User) error {
+			*u = *user
+			return nil
+		})
+		if err != nil {
+			return nil, change.Change{}, fmt.Errorf("updating user: %w", err)
+		}
 	}
 
-	err = usersChangedHook(a.db, a.polMan, a.notifier)
-	if err != nil {
-		return nil, fmt.Errorf("updating resources using user: %w", err)
-	}
-
-	return user, nil
+	return user, c, nil
 }
 
 func (a *AuthProviderOIDC) handleRegistration(
@@ -489,60 +554,49 @@ func (a *AuthProviderOIDC) handleRegistration(
 	registrationID types.RegistrationID,
 	expiry time.Time,
 ) (bool, error) {
-	ipv4, ipv6, err := a.ipAlloc.Next()
-	if err != nil {
-		return false, err
-	}
-
-	node, newNode, err := a.db.HandleNodeFromAuthPath(
+	node, nodeChange, err := a.h.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		&expiry,
 		util.RegisterMethodOIDC,
-		ipv4, ipv6,
 	)
 	if err != nil {
 		return false, fmt.Errorf("could not register node: %w", err)
 	}
 
-	// Send an update to all nodes if this is a new node that they need to know
-	// about.
-	// If this is a refresh, just send new expiry updates.
-	updateSent, err := nodesChangedHook(a.db, a.polMan, a.notifier)
+	// This is a bit of a back and forth, but we have a bit of a chicken and egg
+	// dependency here.
+	// Because the way the policy manager works, we need to have the node
+	// in the database, then add it to the policy manager and then we can
+	// approve the route. This means we get this dance where the node is
+	// first added to the database, then we add it to the policy manager via
+	// SaveNode (which automatically updates the policy manager) and then we can auto approve the routes.
+	// As that only approves the struct object, we need to save it again and
+	// ensure we send an update.
+	// This works, but might be another good candidate for doing some sort of
+	// eventbus.
+	routesChange, err := a.h.state.AutoApproveRoutes(node)
 	if err != nil {
-		return false, fmt.Errorf("updating resources using node: %w", err)
+		return false, fmt.Errorf("auto approving routes: %w", err)
 	}
 
-	if !updateSent {
-		ctx := types.NotifyCtx(context.Background(), "oidc-expiry-self", node.Hostname)
-		a.notifier.NotifyByNodeID(
-			ctx,
-			types.UpdateSelf(node.ID),
-			node.ID,
-		)
+	// Send both changes. Empty changes are ignored by Change().
+	a.h.Change(nodeChange, routesChange)
 
-		ctx = types.NotifyCtx(context.Background(), "oidc-expiry-peers", node.Hostname)
-		a.notifier.NotifyWithIgnore(ctx, types.UpdatePeerChanged(node.ID), node.ID)
-	}
-
-	return newNode, nil
+	return !nodeChange.IsEmpty(), nil
 }
 
-// TODO(kradalby):
-// Rewrite in elem-go.
 func renderOIDCCallbackTemplate(
 	user *types.User,
 	verb string,
 ) (*bytes.Buffer, error) {
-	var content bytes.Buffer
-	if err := oidcCallbackTemplate.Execute(&content, oidcCallbackTemplateConfig{
-		User: user.Display(),
-		Verb: verb,
-	}); err != nil {
-		return nil, fmt.Errorf("rendering OIDC callback template: %w", err)
-	}
+	html := templates.OIDCCallback(user.Display(), verb).Render()
+	return bytes.NewBufferString(html), nil
+}
 
-	return &content, nil
+// getCookieName generates a unique cookie name based on a cookie value.
+func getCookieName(baseName, value string) string {
+	return fmt.Sprintf("%s_%s", baseName, value[:6])
 }
 
 func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string, error) {
@@ -553,7 +607,7 @@ func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string,
 
 	c := &http.Cookie{
 		Path:     "/oidc/callback",
-		Name:     name,
+		Name:     getCookieName(name, val),
 		Value:    val,
 		MaxAge:   int(time.Hour.Seconds()),
 		Secure:   r.TLS != nil,

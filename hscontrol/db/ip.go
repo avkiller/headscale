@@ -17,6 +17,8 @@ import (
 	"tailscale.com/net/tsaddr"
 )
 
+var errGeneratedIPBytesInvalid = errors.New("generated ip bytes are invalid ip")
+
 // IPAllocator is a singleton responsible for allocating
 // IP addresses for nodes and making sure the same
 // address is not handed out twice. There can only be one
@@ -236,7 +238,7 @@ func randomNext(pfx netip.Prefix) (netip.Addr, error) {
 
 	ip, ok := netip.AddrFromSlice(valInRange.Bytes())
 	if !ok {
-		return netip.Addr{}, fmt.Errorf("generated ip bytes are invalid ip")
+		return netip.Addr{}, errGeneratedIPBytesInvalid
 	}
 
 	if !pfx.Contains(ip) {
@@ -273,7 +275,7 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 			return errors.New("backfilling IPs: ip allocator was nil")
 		}
 
-		log.Trace().Msgf("starting to backfill IPs")
+		log.Trace().Caller().Msgf("starting to backfill IPs")
 
 		nodes, err := ListNodes(tx)
 		if err != nil {
@@ -281,7 +283,7 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 		}
 
 		for _, node := range nodes {
-			log.Trace().Uint64("node.id", node.ID.Uint64()).Msg("checking if need backfill")
+			log.Trace().Caller().Uint64("node.id", node.ID.Uint64()).Str("node.name", node.Hostname).Msg("IP backfill check started because node found in database")
 
 			changed := false
 			// IPv4 prefix is set, but node ip is missing, alloc
@@ -323,7 +325,11 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 			}
 
 			if changed {
-				err := tx.Save(node).Error
+				// Use Updates() with Select() to only update IP fields, avoiding overwriting
+				// other fields like Expiry. We need Select() because Updates() alone skips
+				// zero values, but we DO want to update IPv4/IPv6 to nil when removing them.
+				// See issue #2862.
+				err := tx.Model(node).Select("ipv4", "ipv6").Updates(node).Error
 				if err != nil {
 					return fmt.Errorf("saving node(%d) after adding IPs: %w", node.ID, err)
 				}
@@ -334,4 +340,13 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 	})
 
 	return ret, err
+}
+
+func (i *IPAllocator) FreeIPs(ips []netip.Addr) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	for _, ip := range ips {
+		i.usedIPs.Remove(ip)
+	}
 }
